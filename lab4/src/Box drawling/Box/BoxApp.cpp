@@ -2,6 +2,13 @@
 #include "../../Common/MathHelper.h"
 #include "../../Common/UploadBuffer.h"
 
+#define TINYOBJLOADER_IMPLEMENTATION
+#include "tiny_obj_loader.h"
+#include <vector>
+#include <string>
+#include <stdexcept>
+
+
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 using namespace DirectX::PackedVector;
@@ -341,8 +348,8 @@ void BoxApp::BuildShadersAndInputLayout()
 {
     HRESULT hr = S_OK;
     
-	mvsByteCode = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "VS", "vs_5_0");
-	mpsByteCode = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "PS", "ps_5_0");
+	mvsByteCode = d3dUtil::CompileShader(L"..\\Shaders\\color.hlsl", nullptr, "VS", "vs_5_0");
+	mpsByteCode = d3dUtil::CompileShader(L"..\\Shaders\\color.hlsl", nullptr, "PS", "ps_5_0");
 
     mInputLayout =
     {
@@ -353,75 +360,107 @@ void BoxApp::BuildShadersAndInputLayout()
 
 void BoxApp::BuildBoxGeometry()
 {
-    std::array<Vertex, 8> vertices =
+    // Путь: либо "sponza.obj" рядом с .exe (working dir),
+    // либо укажи относительный путь типа "Assets\\sponza.obj".
+    std::string inputfile = "Sponza\\sponza.obj";
+
+    tinyobj::ObjReaderConfig reader_config;
+    reader_config.triangulate = true;
+
+    tinyobj::ObjReader reader;
+    if (!reader.ParseFromFile(inputfile, reader_config))
     {
-        Vertex({ XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT4(Colors::White) }),
-		Vertex({ XMFLOAT3(-1.0f, +1.0f, -1.0f), XMFLOAT4(Colors::Black) }),
-		Vertex({ XMFLOAT3(+1.0f, +1.0f, -1.0f), XMFLOAT4(Colors::Red) }),
-		Vertex({ XMFLOAT3(+1.0f, -1.0f, -1.0f), XMFLOAT4(Colors::Green) }),
-		Vertex({ XMFLOAT3(-1.0f, -1.0f, +1.0f), XMFLOAT4(Colors::Blue) }),
-		Vertex({ XMFLOAT3(-1.0f, +1.0f, +1.0f), XMFLOAT4(Colors::Yellow) }),
-		Vertex({ XMFLOAT3(+1.0f, +1.0f, +1.0f), XMFLOAT4(Colors::Cyan) }),
-		Vertex({ XMFLOAT3(+1.0f, -1.0f, +1.0f), XMFLOAT4(Colors::Magenta) })
-    };
+        if (!reader.Error().empty())
+            OutputDebugStringA(reader.Error().c_str());
 
-	std::array<std::uint16_t, 36> indices =
-	{
-		// front face
-		0, 1, 2,
-		0, 2, 3,
+        throw std::runtime_error("Failed to load sponza.obj (tinyobj). Check working directory / path.");
+    }
 
-		// back face
-		4, 6, 5,
-		4, 7, 6,
+    auto& attrib = reader.GetAttrib();
+    auto& shapes = reader.GetShapes();
 
-		// left face
-		4, 5, 1,
-		4, 1, 0,
+    std::vector<Vertex> vertices;
+    std::vector<std::uint32_t> indices;
 
-		// right face
-		3, 2, 6,
-		3, 6, 7,
+    // Важно: для Sponza вершин/индексов > 65535, нужны 32-битные индексы.
+    vertices.reserve(500000);
+    indices.reserve(500000);
 
-		// top face
-		1, 5, 6,
-		1, 6, 2,
+    for (const auto& shape : shapes)
+    {
+        for (const auto& idx : shape.mesh.indices)
+        {
+            Vertex v = {};
 
-		// bottom face
-		4, 0, 3,
-		4, 3, 7
-	};
+            // POSITION
+            v.Pos.x = attrib.vertices[3 * idx.vertex_index + 0];
+            v.Pos.y = attrib.vertices[3 * idx.vertex_index + 1];
+            v.Pos.z = attrib.vertices[3 * idx.vertex_index + 2];
+
+            // Масштаб как в kg_lab4.cpp (иначе она огромная)
+            v.Pos.x *= 0.01f;
+            v.Pos.y *= 0.01f;
+            v.Pos.z *= 0.01f;
+
+            // COLOR: чтобы не менять шейдер, просто задаём цвет.
+            // Если в obj есть нормали — окрасим по нормали (будет красиво).
+            if (idx.normal_index >= 0 && !attrib.normals.empty())
+            {
+                float nx = attrib.normals[3 * idx.normal_index + 0];
+                float ny = attrib.normals[3 * idx.normal_index + 1];
+                float nz = attrib.normals[3 * idx.normal_index + 2];
+
+                // [-1..1] -> [0..1]
+                v.Color = XMFLOAT4(0.5f * nx + 0.5f, 0.5f * ny + 0.5f, 0.5f * nz + 0.5f, 1.0f);
+            }
+            else
+            {
+                v.Color = XMFLOAT4(0.8f, 0.8f, 0.8f, 1.0f);
+            }
+
+            vertices.push_back(v);
+            indices.push_back((std::uint32_t)indices.size());
+        }
+    }
 
     const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
-	const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
+    const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint32_t);
 
-	mBoxGeo = std::make_unique<MeshGeometry>();
-	mBoxGeo->Name = "boxGeo";
+    mBoxGeo = std::make_unique<MeshGeometry>();
+    mBoxGeo->Name = "sponzaGeo";
 
-	ThrowIfFailed(D3DCreateBlob(vbByteSize, &mBoxGeo->VertexBufferCPU));
-	CopyMemory(mBoxGeo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
+    ThrowIfFailed(D3DCreateBlob(vbByteSize, &mBoxGeo->VertexBufferCPU));
+    CopyMemory(mBoxGeo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
 
-	ThrowIfFailed(D3DCreateBlob(ibByteSize, &mBoxGeo->IndexBufferCPU));
-	CopyMemory(mBoxGeo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
+    ThrowIfFailed(D3DCreateBlob(ibByteSize, &mBoxGeo->IndexBufferCPU));
+    CopyMemory(mBoxGeo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
 
-	mBoxGeo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
-		mCommandList.Get(), vertices.data(), vbByteSize, mBoxGeo->VertexBufferUploader);
+    mBoxGeo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(
+        md3dDevice.Get(), mCommandList.Get(),
+        vertices.data(), vbByteSize,
+        mBoxGeo->VertexBufferUploader);
 
-	mBoxGeo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
-		mCommandList.Get(), indices.data(), ibByteSize, mBoxGeo->IndexBufferUploader);
+    mBoxGeo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(
+        md3dDevice.Get(), mCommandList.Get(),
+        indices.data(), ibByteSize,
+        mBoxGeo->IndexBufferUploader);
 
-	mBoxGeo->VertexByteStride = sizeof(Vertex);
-	mBoxGeo->VertexBufferByteSize = vbByteSize;
-	mBoxGeo->IndexFormat = DXGI_FORMAT_R16_UINT;
-	mBoxGeo->IndexBufferByteSize = ibByteSize;
+    mBoxGeo->VertexByteStride = sizeof(Vertex);
+    mBoxGeo->VertexBufferByteSize = vbByteSize;
 
-	SubmeshGeometry submesh;
-	submesh.IndexCount = (UINT)indices.size();
-	submesh.StartIndexLocation = 0;
-	submesh.BaseVertexLocation = 0;
+    // КЛЮЧЕВО: 32-bit индексы
+    mBoxGeo->IndexFormat = DXGI_FORMAT_R32_UINT;
+    mBoxGeo->IndexBufferByteSize = ibByteSize;
 
-	mBoxGeo->DrawArgs["box"] = submesh;
+    SubmeshGeometry submesh;
+    submesh.IndexCount = (UINT)indices.size();
+    submesh.StartIndexLocation = 0;
+    submesh.BaseVertexLocation = 0;
+
+    // Оставляем ключ "box", чтобы вообще ничего больше не менять в Draw().
+    mBoxGeo->DrawArgs["box"] = submesh;
 }
+
 
 void BoxApp::BuildPSO()
 {
