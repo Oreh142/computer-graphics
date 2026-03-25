@@ -39,7 +39,7 @@ struct ObjectConstants
     XMFLOAT3   LightDir      = { 0, 1, 0 };               //  12 bytes  (set in Update)
     float      Pad0          = 0;                          //   4 bytes
     XMFLOAT3   LightColor    = { 1, 1, 1 };               //  12 bytes
-    float      Pad1          = 0;                          //   4 bytes
+    float      Time          = 0;                          //   4 bytes
 };                                                         // = 240 bytes
 
 // ---------------------------------------------------------------------------
@@ -373,6 +373,7 @@ void BoxApp::Update(const GameTimer& gt)
         obj.DiffuseAlbedo = mMaterialDraws[i].diffuseAlbedo;
         obj.LightDir      = lightDirF3;
         obj.LightColor    = lightColorF3;
+        obj.Time = gt.TotalTime();
 
         mObjectCB->CopyData(i, obj);
     }

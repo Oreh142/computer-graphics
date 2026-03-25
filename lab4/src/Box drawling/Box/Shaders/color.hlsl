@@ -16,7 +16,7 @@ cbuffer cbPerObject : register(b0)
     float3   gLightDir;       // unit vector towards the light (world space)
     float    gPad0;
     float3   gLightColor;     // light RGB colour
-    float    gPad1;
+    float    gTime;           // time in seconds
 };
 
 Texture2D    gDiffuseMap     : register(t0);
@@ -40,8 +40,16 @@ VertexOut VS(VertexIn vin)
 {
     VertexOut vout;
 
-    vout.PosH    = mul(float4(vin.PosL, 1.0f), gWorldViewProj);
-    vout.NormalW = mul(vin.NormalL, (float3x3)gWorld);
+    // Vertex compression animation along Y axis
+    float scaleY = 1.0f + 0.3f * sin(gTime * 2.0f);
+    float3 animPos = vin.PosL;
+    animPos.y *= scaleY;
+
+    vout.PosH    = mul(float4(animPos, 1.0f), gWorldViewProj);
+
+    float3 animNormal = vin.NormalL;
+    animNormal.y /= scaleY;
+    vout.NormalW = normalize(mul(animNormal, (float3x3)gWorld));
 
     float4 texC = mul(float4(vin.TexC, 0.0f, 1.0f), gTexTransform);
     vout.TexC   = texC.xy;
