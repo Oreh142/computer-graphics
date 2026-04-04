@@ -1,24 +1,29 @@
 #include "../../Common/d3dApp.h"
 #include "../../Common/MathHelper.h"
 #include "../../Common/UploadBuffer.h"
+#include "../../Common/d3dUtil.h"
+#include "../../Common/FreeCamera.h"
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
+#include "GBuffer.h"
+#include "RenderingSystem.h"
 
 #include <vector>
 #include <string>
-#include <map>
-#include <algorithm>
 #include <stdexcept>
-#include <cstdio>
+#include <unordered_map>
+#include <fstream>
+#include <filesystem>
+#include <cstdint>
+#include <algorithm>
+#include <cassert>
+#include <sstream>
+#include <iomanip>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
-using namespace DirectX::PackedVector;
 
-// ---------------------------------------------------------------------------
-// Vertex: position + normal + UV texture coordinate
-// ---------------------------------------------------------------------------
 struct Vertex
 {
     XMFLOAT3 Pos;
@@ -26,264 +31,171 @@ struct Vertex
     XMFLOAT2 TexC;
 };
 
-// ---------------------------------------------------------------------------
-// Per-object constant buffer (must match cbuffer layout in color.hlsl)
-// Total: 240 bytes → aligned to 256 for D3D12 CB requirements.
-// ---------------------------------------------------------------------------
 struct ObjectConstants
 {
-    XMFLOAT4X4 WorldViewProj = MathHelper::Identity4x4(); //  64 bytes
-    XMFLOAT4X4 World         = MathHelper::Identity4x4(); //  64 bytes
-    XMFLOAT4X4 TexTransform  = MathHelper::Identity4x4(); //  64 bytes
-    XMFLOAT4   DiffuseAlbedo = { 1, 1, 1, 1 };            //  16 bytes
-    XMFLOAT3   LightDir      = { 0, 1, 0 };               //  12 bytes  (set in Update)
-    float      Pad0          = 0;                          //   4 bytes
-    XMFLOAT3   LightColor    = { 1, 1, 1 };               //  12 bytes
-    float      Time          = 0;                          //   4 bytes
-};                                                         // = 240 bytes
-
-// ---------------------------------------------------------------------------
-// Per-material draw record
-// ---------------------------------------------------------------------------
-struct MaterialDraw
-{
-    SubmeshGeometry submesh;
-    int             textureIndex  = 0;
-    XMFLOAT4        diffuseAlbedo = { 1, 1, 1, 1 };
-
-    // UV tiling scale (multiplied onto UV in VS via TexTransform)
-    float tilingX  = 1.0f;
-    float tilingY  = 1.0f;
-
-    // UV scroll animation
-    bool  animated = false;
-    float scrollX  = 0.0f;   // units per second along U
-    float scrollY  = 0.0f;   // units per second along V
+    XMFLOAT4X4 World = MathHelper::Identity4x4();
+    XMFLOAT4X4 WorldViewProj = MathHelper::Identity4x4();
+    XMFLOAT2 UvScale = XMFLOAT2(1.0f, 1.0f);
+    XMFLOAT2 UvOffset = XMFLOAT2(0.0f, 0.0f);
+    XMFLOAT4 Tint = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
 };
 
-// ===========================================================================
-//  TGA loader helpers (file-local, no header needed)
-// ===========================================================================
-
-// Load a 24- or 32-bit uncompressed (type 2) or RLE (type 10) TGA file.
-// Converts BGR(A) → RGBA and flips rows to top-down for D3D12.
-static bool LoadTGABytes(const char* path,
-                          std::vector<uint8_t>& outRGBA,
-                          UINT& outW, UINT& outH)
+struct TgaImage
 {
-    FILE* fp = nullptr;
-    if (fopen_s(&fp, path, "rb") != 0 || !fp) return false;
+    int Width = 0;
+    int Height = 0;
+    std::vector<uint8_t> Rgba;
+};
 
-#pragma pack(push, 1)
-    struct TGAHeader
+static TgaImage LoadTgaRgba(const std::wstring& filePath)
+{
+    std::ifstream in(filePath, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("Failed to open .tga file");
+
+    uint8_t header[18] = {};
+    in.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (!in)
+        throw std::runtime_error("Failed to read .tga header");
+
+    const uint8_t idLength = header[0];
+    const uint8_t imageType = header[2];
+    const uint16_t width = static_cast<uint16_t>(header[12] | (header[13] << 8));
+    const uint16_t height = static_cast<uint16_t>(header[14] | (header[15] << 8));
+    const uint8_t bpp = header[16];
+    const uint8_t imageDesc = header[17];
+
+    if (imageType != 2 || (bpp != 24 && bpp != 32))
+        throw std::runtime_error("Only uncompressed 24/32-bit TGA is supported");
+
+    if (idLength > 0)
+        in.seekg(idLength, std::ios::cur);
+
+    const int pixelBytes = bpp / 8;
+    const size_t srcSize = static_cast<size_t>(width) * height * pixelBytes;
+    std::vector<uint8_t> src(srcSize);
+    in.read(reinterpret_cast<char*>(src.data()), srcSize);
+    if (!in)
+        throw std::runtime_error("Failed to read .tga pixel data");
+
+    TgaImage img;
+    img.Width = width;
+    img.Height = height;
+    img.Rgba.resize(static_cast<size_t>(width) * height * 4);
+
+    const bool topOrigin = (imageDesc & 0x20) != 0;
+
+    for (int y = 0; y < height; ++y)
     {
-        uint8_t  idLen;
-        uint8_t  colMapType;
-        uint8_t  imgType;
-        uint8_t  colMapSpec[5];
-        uint16_t xOrigin, yOrigin;
-        uint16_t width, height;
-        uint8_t  bpp;
-        uint8_t  imgDesc;
-    };
-#pragma pack(pop)
-
-    TGAHeader hdr = {};
-    fread(&hdr, sizeof(hdr), 1, fp);
-    if (hdr.idLen) fseek(fp, hdr.idLen, SEEK_CUR);
-
-    outW = hdr.width;
-    outH = hdr.height;
-
-    const int ch  = hdr.bpp / 8;   // bytes per pixel (3 or 4)
-    const int num = hdr.width * hdr.height;
-
-    outRGBA.resize(num * 4);
-
-    // Convert one BGR(A) pixel to RGBA at destination index dst.
-    auto conv = [&](const uint8_t* src, int dst)
-    {
-        outRGBA[dst * 4 + 0] = src[2];
-        outRGBA[dst * 4 + 1] = src[1];
-        outRGBA[dst * 4 + 2] = src[0];
-        outRGBA[dst * 4 + 3] = (ch == 4) ? src[3] : 255u;
-    };
-
-    std::vector<uint8_t> px(ch);
-
-    if (hdr.imgType == 2)   // uncompressed true-colour
-    {
-        for (int i = 0; i < num; i++)
+        const int srcY = topOrigin ? y : (height - 1 - y);
+        for (int x = 0; x < width; ++x)
         {
-            fread(px.data(), 1, ch, fp);
-            conv(px.data(), i);
-        }
-    }
-    else if (hdr.imgType == 10) // RLE true-colour
-    {
-        int i = 0;
-        while (i < num)
-        {
-            uint8_t pkt; fread(&pkt, 1, 1, fp);
-            int cnt = (pkt & 0x7F) + 1;
-            if (pkt & 0x80)
-            {
-                fread(px.data(), 1, ch, fp);
-                for (int k = 0; k < cnt; k++) conv(px.data(), i++);
-            }
-            else
-            {
-                for (int k = 0; k < cnt; k++)
-                {
-                    fread(px.data(), 1, ch, fp);
-                    conv(px.data(), i++);
-                }
-            }
-        }
-    }
-    else
-    {
-        fclose(fp);
-        return false; // unsupported TGA image type
-    }
-
-    // TGA is stored bottom-up unless imgDesc bit5 is set; flip for D3D12 (top-down).
-    if ((hdr.imgDesc & 0x20) == 0)
-    {
-        for (UINT r = 0; r < hdr.height / 2; r++)
-        {
-            uint8_t* a = &outRGBA[r                    * hdr.width * 4];
-            uint8_t* b = &outRGBA[(hdr.height - 1 - r) * hdr.width * 4];
-            std::swap_ranges(a, a + hdr.width * 4, b);
+            const size_t s = (static_cast<size_t>(srcY) * width + x) * pixelBytes;
+            const size_t d = (static_cast<size_t>(y) * width + x) * 4;
+            img.Rgba[d + 0] = src[s + 2];
+            img.Rgba[d + 1] = src[s + 1];
+            img.Rgba[d + 2] = src[s + 0];
+            img.Rgba[d + 3] = (pixelBytes == 4) ? src[s + 3] : 255;
         }
     }
 
-    fclose(fp);
-    return true;
+    return img;
 }
 
-// Create a D3D12 DXGI_FORMAT_R8G8B8A8_UNORM Texture2D from raw RGBA bytes
-// and record the copy commands into cmdList.
-// outUpload must stay alive until the GPU upload fence is signalled.
-static void CreateTex2DFromRGBA(ID3D12Device*              device,
-                                 ID3D12GraphicsCommandList* cmdList,
-                                 const std::vector<uint8_t>& rgba,
-                                 UINT w, UINT h,
-                                 ComPtr<ID3D12Resource>&    outResource,
-                                 ComPtr<ID3D12Resource>&    outUpload)
+
+class DeferredRenderer
 {
-    D3D12_RESOURCE_DESC td = {};
-    td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width            = w;
-    td.Height           = h;
-    td.DepthOrArraySize = 1;
-    td.MipLevels        = 1;
-    td.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
-    td.SampleDesc       = { 1, 0 };
+public:
+    GBuffer Buffers;
+    RenderingSystem Lighting;
+};
 
-    ThrowIfFailed(device->CreateCommittedResource(
-        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
-        D3D12_HEAP_FLAG_NONE, &td,
-        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-        IID_PPV_ARGS(&outResource)));
-
-    UINT64 uploadSize = 0;
-    device->GetCopyableFootprints(&td, 0, 1, 0, nullptr, nullptr, nullptr, &uploadSize);
-
-    ThrowIfFailed(device->CreateCommittedResource(
-        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
-        D3D12_HEAP_FLAG_NONE,
-        &CD3DX12_RESOURCE_DESC::Buffer(uploadSize),
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&outUpload)));
-
-    D3D12_SUBRESOURCE_DATA sub = {};
-    sub.pData      = rgba.data();
-    sub.RowPitch   = (LONG_PTR)(w * 4);
-    sub.SlicePitch = (LONG_PTR)(w * h * 4);
-
-    UpdateSubresources(cmdList, outResource.Get(), outUpload.Get(), 0, 0, 1, &sub);
-
-    cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-        outResource.Get(),
-        D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-}
-
-// ===========================================================================
-//  BoxApp
-// ===========================================================================
 class BoxApp : public D3DApp
 {
 public:
     BoxApp(HINSTANCE hInstance);
-    BoxApp(const BoxApp&) = delete;
-    BoxApp& operator=(const BoxApp&) = delete;
+    BoxApp(const BoxApp& rhs) = delete;
+    BoxApp& operator=(const BoxApp& rhs) = delete;
     ~BoxApp();
 
-    virtual bool Initialize() override;
+    virtual bool Initialize()override;
 
 private:
-    virtual void OnResize()  override;
-    virtual void Update(const GameTimer& gt) override;
-    virtual void Draw(const GameTimer& gt)   override;
+    virtual void OnResize()override;
+    virtual void Update(const GameTimer& gt)override;
+    virtual void Draw(const GameTimer& gt)override;
+    virtual std::wstring GetAdditionalWindowText() const override;
 
-    virtual void OnMouseDown(WPARAM btnState, int x, int y) override;
-    virtual void OnMouseUp  (WPARAM btnState, int x, int y) override;
-    virtual void OnMouseMove(WPARAM btnState, int x, int y) override;
+    virtual void OnMouseDown(WPARAM btnState, int x, int y)override;
+    virtual void OnMouseUp(WPARAM btnState, int x, int y)override;
+    virtual void OnMouseMove(WPARAM btnState, int x, int y)override;
 
-    void LoadTextures();
-    void BuildBoxGeometry();
     void BuildDescriptorHeaps();
     void BuildConstantBuffers();
-    void BuildTextureViews();
-    void BuildRootSignature();
+    void BuildRootSignatures();
     void BuildShadersAndInputLayout();
-    void BuildPSO();
+    void BuildBoxGeometry();
+    void BuildPSOs();
+    void BuildLights();
+    UINT LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName);
 
 private:
-    ComPtr<ID3D12RootSignature>  mRootSignature = nullptr;
-    ComPtr<ID3D12PipelineState>  mPSO           = nullptr;
-    ComPtr<ID3DBlob>             mvsByteCode    = nullptr;
-    ComPtr<ID3DBlob>             mpsByteCode    = nullptr;
+    struct DrawBatch
+    {
+        UINT IndexCount = 0;
+        UINT StartIndexLocation = 0;
+        UINT SrvIndex = 0;
+        XMFLOAT4 Tint = XMFLOAT4(1, 1, 1, 1);
+    };
 
-    // Combined CBV + SRV descriptor heap
+    ComPtr<ID3D12RootSignature> mGeometryRootSignature = nullptr;
+    ComPtr<ID3D12RootSignature> mLightingRootSignature = nullptr;
     ComPtr<ID3D12DescriptorHeap> mCbvSrvHeap = nullptr;
 
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB = nullptr;
-    std::unique_ptr<MeshGeometry>                  mBoxGeo   = nullptr;
+    std::unique_ptr<UploadBuffer<DeferredPassConstants>> mDeferredCB = nullptr;
+    DeferredRenderer mDeferredRenderer;
 
-    std::vector<std::unique_ptr<Texture>> mTextures;       // loaded TGA textures
-    std::vector<MaterialDraw>             mMaterialDraws;  // per-material draw calls
+    std::unique_ptr<MeshGeometry> mBoxGeo = nullptr;
+    std::vector<DrawBatch> mDrawBatches;
+    std::vector<std::unique_ptr<Texture>> mTextures;
+    std::unordered_map<std::string, UINT> mTextureIndexByName;
+
+    ComPtr<ID3DBlob> mGBufferVS = nullptr;
+    ComPtr<ID3DBlob> mGBufferPS = nullptr;
+    ComPtr<ID3DBlob> mLightingVS = nullptr;
+    ComPtr<ID3DBlob> mLightingPS = nullptr;
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
 
-    XMFLOAT4X4 mWorld = MathHelper::Identity4x4();
-    XMFLOAT4X4 mView  = MathHelper::Identity4x4();
-    XMFLOAT4X4 mProj  = MathHelper::Identity4x4();
+    ComPtr<ID3D12PipelineState> mGBufferPSO = nullptr;
+    ComPtr<ID3D12PipelineState> mLightingPSO = nullptr;
 
-    // Camera (spherical).  mRadius tuned for a ~1-unit head model.
-    float mTheta  = 1.5f * XM_PI;
-    float mPhi    = XM_PIDIV4;
-    float mRadius = 3.0f;
+    XMFLOAT4X4 mWorld = MathHelper::Identity4x4();
+    FreeCamera mCamera;
+    float mMoveSpeed = 10.0f;
+    float mLookSpeed = 2.0f;
+
+    float mUvTile = 1.0f;
+    float mUvAnimSpeedU = 0.1f;
+    float mUvAnimSpeedV = 0.05f;
 
     POINT mLastMousePos;
 };
 
-// ===========================================================================
-//  WinMain
-// ===========================================================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
-                   PSTR cmdLine, int showCmd)
+    PSTR cmdLine, int showCmd)
 {
 #if defined(DEBUG) | defined(_DEBUG)
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif
+
     try
     {
         BoxApp theApp(hInstance);
         if (!theApp.Initialize())
             return 0;
+
         return theApp.Run();
     }
     catch (DxException& e)
@@ -293,554 +205,669 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
     }
 }
 
-BoxApp::BoxApp(HINSTANCE hInstance) : D3DApp(hInstance) {}
-BoxApp::~BoxApp() {}
+BoxApp::BoxApp(HINSTANCE hInstance)
+    : D3DApp(hInstance)
+{
+    mCamera.SetPosition(0.0f, 2.0f, -8.0f);
+}
 
-// ===========================================================================
-//  Initialize
-// ===========================================================================
+BoxApp::~BoxApp()
+{
+}
+
 bool BoxApp::Initialize()
 {
-    if (!D3DApp::Initialize()) return false;
+    if (!D3DApp::Initialize())
+        return false;
+
     ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
 
-    LoadTextures();       // upload TGA files to GPU (needs open cmd list)
-    BuildBoxGeometry();   // load OBJ, build VB/IB, group by material
-    BuildDescriptorHeaps();
-    BuildConstantBuffers();
-    BuildTextureViews();
-    BuildRootSignature();
     BuildShadersAndInputLayout();
-    BuildPSO();
+    BuildBoxGeometry();
+    BuildConstantBuffers();
+    BuildDescriptorHeaps();
+    BuildRootSignatures();
+    BuildPSOs();
+    mDeferredRenderer.Buffers.Build(md3dDevice.Get(), mClientWidth, mClientHeight);
+    BuildLights();
 
     ThrowIfFailed(mCommandList->Close());
-    ID3D12CommandList* cmds[] = { mCommandList.Get() };
-    mCommandQueue->ExecuteCommandLists(_countof(cmds), cmds);
+    ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
+    mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
     FlushCommandQueue();
 
     return true;
 }
 
-// ===========================================================================
-//  OnResize
-// ===========================================================================
 void BoxApp::OnResize()
 {
     D3DApp::OnResize();
-    XMMATRIX P = XMMatrixPerspectiveFovLH(0.25f * MathHelper::Pi, AspectRatio(), 0.1f, 100.0f);
-    XMStoreFloat4x4(&mProj, P);
+
+    mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
+    if (mDeferredRenderer.Buffers.IsInitialized())
+        mDeferredRenderer.Buffers.Resize(md3dDevice.Get(), mClientWidth, mClientHeight);
 }
 
-// ===========================================================================
-//  Update  –  rebuild per-material constant buffers
-// ===========================================================================
+std::wstring BoxApp::GetAdditionalWindowText() const
+{
+    const XMFLOAT3 cameraPos = mCamera.GetPosition3f();
+
+    std::wostringstream stream;
+    stream << std::fixed << std::setprecision(2)
+           << L"cam xyz: (" << cameraPos.x << L", " << cameraPos.y << L", " << cameraPos.z << L")";
+
+    return stream.str();
+}
+
 void BoxApp::Update(const GameTimer& gt)
 {
-    float x = mRadius * sinf(mPhi) * cosf(mTheta);
-    float z = mRadius * sinf(mPhi) * sinf(mTheta);
-    float y = mRadius * cosf(mPhi);
+    const float dt = gt.DeltaTime();
+    const float moveStep = mMoveSpeed * dt;
 
-    XMMATRIX view = XMMatrixLookAtLH(
-        XMVectorSet(x, y, z, 1.0f),
-        XMVectorZero(),
-        XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
-    XMStoreFloat4x4(&mView, view);
+    if (d3dUtil::IsKeyDown('W'))
+        mCamera.Walk(moveStep);
+    if (d3dUtil::IsKeyDown('S'))
+        mCamera.Walk(-moveStep);
+    if (d3dUtil::IsKeyDown('A'))
+        mCamera.Strafe(-moveStep);
+    if (d3dUtil::IsKeyDown('D'))
+        mCamera.Strafe(moveStep);
 
-    XMMATRIX world        = XMLoadFloat4x4(&mWorld);
-    XMMATRIX proj         = XMLoadFloat4x4(&mProj);
+    mCamera.UpdateViewMatrix();
+
+    XMMATRIX world = XMLoadFloat4x4(&mWorld);
+    XMMATRIX view = mCamera.GetView();
+    XMMATRIX proj = mCamera.GetProj();
     XMMATRIX worldViewProj = world * view * proj;
 
-    // Key light: upper-left-front, warm white
-    XMVECTOR lightDir = XMVector3Normalize(XMVectorSet(0.5f, 0.8f, -0.4f, 0.0f));
-    XMFLOAT3 lightDirF3, lightColorF3 = { 1.0f, 0.98f, 0.92f };
-    XMStoreFloat3(&lightDirF3, lightDir);
+    ObjectConstants objConstants;
+    XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
+    XMStoreFloat4x4(&objConstants.WorldViewProj, XMMatrixTranspose(worldViewProj));
+    objConstants.UvScale = XMFLOAT2(mUvTile, mUvTile);
+    objConstants.UvOffset = XMFLOAT2(gt.TotalTime() * mUvAnimSpeedU, gt.TotalTime() * mUvAnimSpeedV);
+    mObjectCB->CopyData(0, objConstants);
 
-    for (int i = 0; i < (int)mMaterialDraws.size(); i++)
-    {
-        const MaterialDraw& mat = mMaterialDraws[i];
+    DeferredPassConstants pass = {};
+    XMMATRIX invView = XMMatrixInverse(nullptr, view);
+    XMMATRIX invProj = XMMatrixInverse(nullptr, proj);
+    XMStoreFloat4x4(&pass.InvView, XMMatrixTranspose(invView));
+    XMStoreFloat4x4(&pass.InvProj, XMMatrixTranspose(invProj));
+    pass.CameraPosW = mCamera.GetPosition3f();
+    pass.PointLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.PointLights.size(), 16));
+    pass.DirectionalLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.DirectionalLights.size(), 8));
+    pass.SpotLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.SpotLights.size(), 8));
 
-        ObjectConstants obj;
-        XMStoreFloat4x4(&obj.WorldViewProj, XMMatrixTranspose(worldViewProj));
-        XMStoreFloat4x4(&obj.World,         XMMatrixTranspose(world));
-        // UV tiling + optional scroll animation
-        XMMATRIX scale  = XMMatrixScaling(mat.tilingX, mat.tilingY, 1.0f);
-        XMMATRIX scroll = XMMatrixIdentity();
-        if (mat.animated)
-            scroll = XMMatrixTranslation(mat.scrollX * gt.TotalTime(),
-                                         mat.scrollY * gt.TotalTime(), 0.0f);
-        XMStoreFloat4x4(&obj.TexTransform, XMMatrixTranspose(scale * scroll));
+    for (UINT i = 0; i < pass.PointLightCount; ++i)
+        pass.PointLights[i] = mDeferredRenderer.Lighting.PointLights[i];
+    for (UINT i = 0; i < pass.DirectionalLightCount; ++i)
+        pass.DirectionalLights[i] = mDeferredRenderer.Lighting.DirectionalLights[i];
+    for (UINT i = 0; i < pass.SpotLightCount; ++i)
+        pass.SpotLights[i] = mDeferredRenderer.Lighting.SpotLights[i];
 
-        obj.DiffuseAlbedo = mMaterialDraws[i].diffuseAlbedo;
-        obj.LightDir      = lightDirF3;
-        obj.LightColor    = lightColorF3;
-        obj.Time = gt.TotalTime();
-
-        mObjectCB->CopyData(i, obj);
-    }
+    mDeferredCB->CopyData(0, pass);
 }
 
-// ===========================================================================
-//  Draw  –  one draw call per material group
-// ===========================================================================
 void BoxApp::Draw(const GameTimer& gt)
 {
     ThrowIfFailed(mDirectCmdListAlloc->Reset());
-    ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), mPSO.Get()));
 
+    auto* albedo = mDeferredRenderer.Buffers.AlbedoResource();
+    auto* normalDepth = mDeferredRenderer.Buffers.NormalDepthResource();
+
+    ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), mGBufferPSO.Get()));
     mCommandList->RSSetViewports(1, &mScreenViewport);
     mCommandList->RSSetScissorRects(1, &mScissorRect);
 
-    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-        CurrentBackBuffer(),
-        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+    CD3DX12_RESOURCE_BARRIER preGeom[2] =
+    {
+        CD3DX12_RESOURCE_BARRIER::Transition(albedo, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        CD3DX12_RESOURCE_BARRIER::Transition(normalDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)
+    };
+    mCommandList->ResourceBarrier(2, preGeom);
 
-    mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::Black, 0, nullptr);
-    mCommandList->ClearDepthStencilView(DepthStencilView(),
-        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+    mCommandList->ClearRenderTargetView(mDeferredRenderer.Buffers.AlbedoRtv(), Colors::Black, 0, nullptr);
+    mCommandList->ClearRenderTargetView(mDeferredRenderer.Buffers.NormalDepthRtv(), Colors::Black, 0, nullptr);
+    mCommandList->ClearDepthStencilView(DepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 
-    mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
+    D3D12_CPU_DESCRIPTOR_HANDLE gbuffers[2] = { mDeferredRenderer.Buffers.AlbedoRtv(), mDeferredRenderer.Buffers.NormalDepthRtv() };
+    mCommandList->OMSetRenderTargets(2, gbuffers, false, &DepthStencilView());
 
-    ID3D12DescriptorHeap* heaps[] = { mCbvSrvHeap.Get() };
-    mCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
-    mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+    ID3D12DescriptorHeap* geomHeaps[] = { mCbvSrvHeap.Get() };
+    mCommandList->SetDescriptorHeaps(_countof(geomHeaps), geomHeaps);
+    mCommandList->SetGraphicsRootSignature(mGeometryRootSignature.Get());
 
     mCommandList->IASetVertexBuffers(0, 1, &mBoxGeo->VertexBufferView());
     mCommandList->IASetIndexBuffer(&mBoxGeo->IndexBufferView());
     mCommandList->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    const UINT descSize     = mCbvSrvUavDescriptorSize;
-    const int  numMaterials = (int)mMaterialDraws.size();
-    auto       gpuStart     = mCbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT descSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const auto baseHandle = mCbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
 
-    // Descriptor layout:
-    //   [0 .. numMaterials-1]         → CBV per material
-    //   [numMaterials .. N+T-1]        → SRV per texture
-
-    for (int i = 0; i < numMaterials; i++)
+    for (const DrawBatch& batch : mDrawBatches)
     {
-        const auto& mat = mMaterialDraws[i];
+        ObjectConstants objConstants;
+        XMMATRIX world = XMLoadFloat4x4(&mWorld);
+        XMMATRIX view = mCamera.GetView();
+        XMMATRIX proj = mCamera.GetProj();
+        XMMATRIX worldViewProj = world * view * proj;
+        XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
+        XMStoreFloat4x4(&objConstants.WorldViewProj, XMMatrixTranspose(worldViewProj));
+        objConstants.UvScale = XMFLOAT2(mUvTile, mUvTile);
+        objConstants.UvOffset = XMFLOAT2(gt.TotalTime() * mUvAnimSpeedU, gt.TotalTime() * mUvAnimSpeedV);
+        objConstants.Tint = batch.Tint;
+        mObjectCB->CopyData(0, objConstants);
 
-        CD3DX12_GPU_DESCRIPTOR_HANDLE cbvHandle(gpuStart, i, descSize);
-        mCommandList->SetGraphicsRootDescriptorTable(0, cbvHandle);
-
-        int srvSlot = numMaterials + mat.textureIndex;
-        CD3DX12_GPU_DESCRIPTOR_HANDLE srvHandle(gpuStart, srvSlot, descSize);
+        auto srvHandle = baseHandle;
+        srvHandle.ptr += static_cast<SIZE_T>(batch.SrvIndex) * descSize;
+        mCommandList->SetGraphicsRootConstantBufferView(0, mObjectCB->Resource()->GetGPUVirtualAddress());
         mCommandList->SetGraphicsRootDescriptorTable(1, srvHandle);
-
-        mCommandList->DrawIndexedInstanced(
-            mat.submesh.IndexCount, 1,
-            mat.submesh.StartIndexLocation,
-            mat.submesh.BaseVertexLocation, 0);
+        mCommandList->DrawIndexedInstanced(batch.IndexCount, 1, batch.StartIndexLocation, 0, 0);
     }
 
-    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-        CurrentBackBuffer(),
+    CD3DX12_RESOURCE_BARRIER toLighting[3] =
+    {
+        CD3DX12_RESOURCE_BARRIER::Transition(albedo, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(normalDepth, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)
+    };
+    mCommandList->ResourceBarrier(3, toLighting);
+
+    mCommandList->SetPipelineState(mLightingPSO.Get());
+    mCommandList->SetGraphicsRootSignature(mLightingRootSignature.Get());
+    D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv = CurrentBackBufferView();
+    mCommandList->ClearRenderTargetView(backBufferRtv, Colors::Black, 0, nullptr);
+    mCommandList->OMSetRenderTargets(1, &backBufferRtv, true, nullptr);
+
+    ID3D12DescriptorHeap* lightHeaps[] = { mDeferredRenderer.Buffers.SrvHeap() };
+    mCommandList->SetDescriptorHeaps(_countof(lightHeaps), lightHeaps);
+    mCommandList->SetGraphicsRootDescriptorTable(0, mDeferredRenderer.Buffers.SrvHeap()->GetGPUDescriptorHandleForHeapStart());
+    mCommandList->SetGraphicsRootConstantBufferView(1, mDeferredCB->Resource()->GetGPUVirtualAddress());
+    mCommandList->IASetVertexBuffers(0, 0, nullptr);
+    mCommandList->IASetIndexBuffer(nullptr);
+    mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mCommandList->DrawInstanced(3, 1, 0, 0);
+
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
 
     ThrowIfFailed(mCommandList->Close());
-    ID3D12CommandList* cmds[] = { mCommandList.Get() };
-    mCommandQueue->ExecuteCommandLists(_countof(cmds), cmds);
+
+    ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
+    mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
 
     ThrowIfFailed(mSwapChain->Present(0, 0));
     mCurrBackBuffer = (mCurrBackBuffer + 1) % SwapChainBufferCount;
+
     FlushCommandQueue();
 }
 
-// ===========================================================================
-//  Mouse input
-// ===========================================================================
 void BoxApp::OnMouseDown(WPARAM btnState, int x, int y)
 {
-    mLastMousePos = { x, y };
+    mLastMousePos.x = x;
+    mLastMousePos.y = y;
+
     SetCapture(mhMainWnd);
 }
 
-void BoxApp::OnMouseUp(WPARAM, int, int)
+void BoxApp::OnMouseUp(WPARAM btnState, int x, int y)
 {
     ReleaseCapture();
 }
 
 void BoxApp::OnMouseMove(WPARAM btnState, int x, int y)
 {
-    if (btnState & MK_LBUTTON)
+    if ((btnState & MK_LBUTTON) != 0)
     {
-        mTheta += XMConvertToRadians(0.25f * (x - mLastMousePos.x));
-        mPhi   += XMConvertToRadians(0.25f * (y - mLastMousePos.y));
-        mPhi    = MathHelper::Clamp(mPhi, 0.1f, MathHelper::Pi - 0.1f);
+        float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x)) * mLookSpeed;
+        float dy = XMConvertToRadians(0.25f * static_cast<float>(y - mLastMousePos.y)) * mLookSpeed;
+        mCamera.Yaw(dx);
+        mCamera.Pitch(dy);
     }
-    else if (btnState & MK_RBUTTON)
-    {
-        float d  = 0.005f * (float)(x - mLastMousePos.x - (y - mLastMousePos.y));
-        mRadius += d;
-        mRadius  = MathHelper::Clamp(mRadius, 0.5f, 8.0f);
-    }
-    mLastMousePos = { x, y };
+
+    mLastMousePos.x = x;
+    mLastMousePos.y = y;
 }
 
-// ===========================================================================
-//  LoadTextures
-//  Loads TGA files for the african_head model.
-//
-//  Required files next to african_head.obj (i.e. in the working directory):
-//    african_head_diffuse.tga  – slot 0, used in the shader as t0
-//    african_head_nm.tga       – slot 1, loaded and bound as t1 (ready for
-//                                normal-mapping when the shader is extended)
-// ===========================================================================
-void BoxApp::LoadTextures()
+UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName)
 {
-    const char* paths[] =
+    if (texName.empty())
+        return 0;
+
+    auto it = mTextureIndexByName.find(texName);
+    if (it != mTextureIndexByName.end())
+        return it->second;
+
+    std::filesystem::path filePath = baseDir / std::filesystem::path(texName);
+
+    auto tex = std::make_unique<Texture>();
+    tex->Name = texName;
+    tex->Filename = filePath.wstring();
+
+    if (!std::filesystem::exists(filePath))
     {
-        "african_head_diffuse.tga",  // index 0 – diffuse colour map
-        "african_head_nm.tga",       // index 1 – normal map (loaded, t1)
-    };
-
-    for (const char* path : paths)
-    {
-        std::vector<uint8_t> rgba;
-        UINT w = 0, h = 0;
-        if (!LoadTGABytes(path, rgba, w, h))
-            throw std::runtime_error(std::string("Cannot load TGA: ") + path);
-
-        auto tex = std::make_unique<Texture>();
-        tex->Name     = path;      // used for matching with OBJ material names
-        tex->Filename = AnsiToWString(path);
-
-        CreateTex2DFromRGBA(md3dDevice.Get(), mCommandList.Get(),
-                            rgba, w, h,
-                            tex->Resource, tex->UploadHeap);
-
-        mTextures.push_back(std::move(tex));
+        throw std::runtime_error("Texture file not found: " + filePath.generic_string());
     }
+
+    TgaImage img = LoadTgaRgba(tex->Filename);
+
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Alignment = 0;
+    texDesc.Width = static_cast<UINT>(img.Width);
+    texDesc.Height = static_cast<UINT>(img.Height);
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(tex->Resource.GetAddressOf())));
+
+    const UINT64 uploadBufferSize = GetRequiredIntermediateSize(tex->Resource.Get(), 0, 1);
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+        D3D12_HEAP_FLAG_NONE,
+        &CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize),
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(tex->UploadHeap.GetAddressOf())));
+
+    D3D12_SUBRESOURCE_DATA subresourceData = {};
+    subresourceData.pData = img.Rgba.data();
+    subresourceData.RowPitch = static_cast<LONG_PTR>(img.Width * 4);
+    subresourceData.SlicePitch = subresourceData.RowPitch * img.Height;
+
+    UpdateSubresources(mCommandList.Get(), tex->Resource.Get(), tex->UploadHeap.Get(), 0, 0, 1, &subresourceData);
+
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        tex->Resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+
+    UINT newIndex = static_cast<UINT>(mTextures.size());
+    mTextureIndexByName[texName] = newIndex;
+    mTextures.push_back(std::move(tex));
+    return newIndex;
 }
 
-// ===========================================================================
-//  BuildBoxGeometry
-//  Loads african_head.obj, reads normals and UVs, groups faces by material,
-//  then uploads a single interleaved vertex + index buffer to the GPU.
-// ===========================================================================
-void BoxApp::BuildBoxGeometry()
-{
-    tinyobj::ObjReaderConfig cfg;
-    cfg.triangulate = true;
-
-    tinyobj::ObjReader reader;
-    if (!reader.ParseFromFile("african_head.obj", cfg))
-    {
-        if (!reader.Error().empty())
-            OutputDebugStringA(reader.Error().c_str());
-        throw std::runtime_error("Failed to load african_head.obj. "
-                                 "Place the file in the working directory.");
-    }
-
-    const auto& attrib    = reader.GetAttrib();
-    const auto& shapes    = reader.GetShapes();
-    const auto& materials = reader.GetMaterials();
-
-    // ---- Group faces by material ID ----------------------------------------
-    struct MatGroup
-    {
-        std::vector<Vertex>   verts;
-        std::vector<uint32_t> inds;
-        int      texIdx = 0;
-        XMFLOAT4 albedo = { 1, 1, 1, 1 };
-    };
-    std::map<int, MatGroup> groups;
-
-    for (const auto& shape : shapes)
-    {
-        int idxOff = 0;
-        for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); f++)
-        {
-            int matId = (f < shape.mesh.material_ids.size())
-                        ? shape.mesh.material_ids[f] : -1;
-            if (matId < 0) matId = 0;
-
-            auto& g = groups[matId];
-
-            // On first use: resolve texture index and albedo from the MTL.
-            if (g.verts.empty())
-            {
-                if (matId < (int)materials.size())
-                {
-                    // Match the MTL diffuse texture name to a loaded Texture.
-                    const std::string& diffName = materials[matId].diffuse_texname;
-                    for (int t = 0; t < (int)mTextures.size(); t++)
-                    {
-                        if (mTextures[t]->Name == diffName)
-                        {
-                            g.texIdx = t;
-                            break;
-                        }
-                    }
-
-                    // Albedo from MTL diffuse values (default to white if black).
-                    const auto& m = materials[matId];
-                    g.albedo =
-                    {
-                        m.diffuse[0] > 0.01f ? m.diffuse[0] : 1.0f,
-                        m.diffuse[1] > 0.01f ? m.diffuse[1] : 1.0f,
-                        m.diffuse[2] > 0.01f ? m.diffuse[2] : 1.0f,
-                        1.0f
-                    };
-                }
-            }
-
-            // Build three vertices for this triangle.
-            for (int v = 0; v < 3; v++)
-            {
-                const auto& idx = shape.mesh.indices[idxOff + v];
-
-                Vertex vert = {};
-
-                vert.Pos =
-                {
-                    attrib.vertices[3 * idx.vertex_index + 0],
-                    attrib.vertices[3 * idx.vertex_index + 1],
-                    attrib.vertices[3 * idx.vertex_index + 2],
-                };
-                // african_head is already in ~1-unit scale; no scaling needed.
-
-                if (idx.normal_index >= 0)
-                {
-                    vert.Normal =
-                    {
-                        attrib.normals[3 * idx.normal_index + 0],
-                        attrib.normals[3 * idx.normal_index + 1],
-                        attrib.normals[3 * idx.normal_index + 2],
-                    };
-                }
-
-                if (idx.texcoord_index >= 0)
-                {
-                    vert.TexC =
-                    {
-                        attrib.texcoords[2 * idx.texcoord_index + 0],
-                        1.0f - attrib.texcoords[2 * idx.texcoord_index + 1], // flip V
-                    };
-                }
-
-                g.inds.push_back((uint32_t)g.verts.size());
-                g.verts.push_back(vert);
-            }
-            idxOff += 3;
-        }
-    }
-
-    // ---- Flatten groups into a single VB / IB -----------------------------
-    std::vector<Vertex>   allV;
-    std::vector<uint32_t> allI;
-    mMaterialDraws.clear();
-
-    for (auto& kv : groups)
-    {
-        MatGroup& g = kv.second;
-        if (g.inds.empty()) continue;
-
-        MaterialDraw md;
-        md.submesh.StartIndexLocation = (UINT)allI.size();
-        md.submesh.BaseVertexLocation = (INT)allV.size();
-        md.submesh.IndexCount         = (UINT)g.inds.size();
-        md.textureIndex  = g.texIdx;
-        md.diffuseAlbedo = g.albedo;
-
-        // Tiling and animation per texture slot:
-        //   slot 0 (diffuse) – 2×2 tiling + slow horizontal UV scroll
-        //   slot 1 (normal)  – same tiling, no animation
-        if (g.texIdx == 0)
-        {
-            md.tilingX  = 2.0f;
-            md.tilingY  = 2.0f;
-            md.animated = true;
-            md.scrollX  = 0.04f;  // 0.04 UV units per second
-            md.scrollY  = 0.0f;
-        }
-        else
-        {
-            md.tilingX  = 2.0f;
-            md.tilingY  = 2.0f;
-            md.animated = false;
-        }
-
-        allI.insert(allI.end(), g.inds.begin(), g.inds.end());
-        allV.insert(allV.end(), g.verts.begin(), g.verts.end());
-
-        mMaterialDraws.push_back(md);
-    }
-
-    // ---- Upload to GPU -----------------------------------------------------
-    const UINT vbSize = (UINT)allV.size() * sizeof(Vertex);
-    const UINT ibSize = (UINT)allI.size() * sizeof(uint32_t);
-
-    mBoxGeo = std::make_unique<MeshGeometry>();
-    mBoxGeo->Name = "headGeo";
-
-    ThrowIfFailed(D3DCreateBlob(vbSize, &mBoxGeo->VertexBufferCPU));
-    CopyMemory(mBoxGeo->VertexBufferCPU->GetBufferPointer(), allV.data(), vbSize);
-
-    ThrowIfFailed(D3DCreateBlob(ibSize, &mBoxGeo->IndexBufferCPU));
-    CopyMemory(mBoxGeo->IndexBufferCPU->GetBufferPointer(), allI.data(), ibSize);
-
-    mBoxGeo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(
-        md3dDevice.Get(), mCommandList.Get(), allV.data(), vbSize,
-        mBoxGeo->VertexBufferUploader);
-
-    mBoxGeo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(
-        md3dDevice.Get(), mCommandList.Get(), allI.data(), ibSize,
-        mBoxGeo->IndexBufferUploader);
-
-    mBoxGeo->VertexByteStride     = sizeof(Vertex);
-    mBoxGeo->VertexBufferByteSize = vbSize;
-    mBoxGeo->IndexFormat          = DXGI_FORMAT_R32_UINT;
-    mBoxGeo->IndexBufferByteSize  = ibSize;
-}
-
-// ===========================================================================
-//  BuildDescriptorHeaps
-//  Layout: [0..N-1] CBV per material | [N..N+T-1] SRV per texture
-// ===========================================================================
 void BoxApp::BuildDescriptorHeaps()
 {
-    const UINT total = (UINT)(mMaterialDraws.size() + mTextures.size());
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.NumDescriptors = static_cast<UINT>(mTextures.size());
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.NodeMask = 0;
+    ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mCbvSrvHeap)));
 
-    D3D12_DESCRIPTOR_HEAP_DESC desc = {};
-    desc.NumDescriptors = total;
-    desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&mCbvSrvHeap)));
+    UINT descriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE hCpu(mCbvSrvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    for (auto& tex : mTextures)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = tex->Resource->GetDesc().Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+        srvDesc.Texture2D.MipLevels = 1;
+        srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+        md3dDevice->CreateShaderResourceView(tex->Resource.Get(), &srvDesc, hCpu);
+        hCpu.Offset(1, descriptorSize);
+    }
 }
 
-// ===========================================================================
-//  BuildConstantBuffers
-//  One CB element and one CBV descriptor per material.
-// ===========================================================================
 void BoxApp::BuildConstantBuffers()
 {
-    const UINT n = (UINT)mMaterialDraws.size();
-    mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(
-        md3dDevice.Get(), n, true);
-
-    const UINT cbSize   = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
-    const UINT descSize = mCbvSrvUavDescriptorSize;
-    D3D12_GPU_VIRTUAL_ADDRESS base = mObjectCB->Resource()->GetGPUVirtualAddress();
-
-    for (UINT i = 0; i < n; i++)
-    {
-        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc;
-        cbvDesc.BufferLocation = base + (UINT64)i * cbSize;
-        cbvDesc.SizeInBytes    = cbSize;
-
-        CD3DX12_CPU_DESCRIPTOR_HANDLE h(
-            mCbvSrvHeap->GetCPUDescriptorHandleForHeapStart(), (INT)i, descSize);
-        md3dDevice->CreateConstantBufferView(&cbvDesc, h);
-    }
+    mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), 1, true);
+    mDeferredCB = std::make_unique<UploadBuffer<DeferredPassConstants>>(md3dDevice.Get(), 1, true);
 }
 
-// ===========================================================================
-//  BuildTextureViews
-//  SRV descriptors placed after all CBV descriptors.
-// ===========================================================================
-void BoxApp::BuildTextureViews()
+void BoxApp::BuildRootSignatures()
 {
-    const UINT numMat   = (UINT)mMaterialDraws.size();
-    const UINT descSize = mCbvSrvUavDescriptorSize;
+    CD3DX12_DESCRIPTOR_RANGE geomSrvTable;
+    geomSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
 
-    for (UINT t = 0; t < (UINT)mTextures.size(); t++)
-    {
-        const auto& tex = mTextures[t];
-        D3D12_RESOURCE_DESC rd = tex->Resource->GetDesc();
+    CD3DX12_ROOT_PARAMETER geomRootParameter[2];
+    geomRootParameter[0].InitAsConstantBufferView(0);
+    geomRootParameter[1].InitAsDescriptorTable(1, &geomSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Shader4ComponentMapping         = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srvDesc.Format                          = rd.Format;
-        srvDesc.ViewDimension                   = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MostDetailedMip       = 0;
-        srvDesc.Texture2D.MipLevels             = rd.MipLevels;
-        srvDesc.Texture2D.ResourceMinLODClamp   = 0.0f;
-
-        CD3DX12_CPU_DESCRIPTOR_HANDLE h(
-            mCbvSrvHeap->GetCPUDescriptorHandleForHeapStart(),
-            (INT)(numMat + t), descSize);
-        md3dDevice->CreateShaderResourceView(tex->Resource.Get(), &srvDesc, h);
-    }
-}
-
-// ===========================================================================
-//  BuildRootSignature
-//  Slot 0: descriptor table → 1 CBV (b0)
-//  Slot 1: descriptor table → 1 SRV (t0)
-//  Static sampler s0: anisotropic wrap
-// ===========================================================================
-void BoxApp::BuildRootSignature()
-{
-    CD3DX12_DESCRIPTOR_RANGE cbvTable;
-    cbvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
-
-    CD3DX12_DESCRIPTOR_RANGE srvTable;
-    srvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
-
-    CD3DX12_ROOT_PARAMETER params[2];
-    params[0].InitAsDescriptorTable(1, &cbvTable);
-    params[1].InitAsDescriptorTable(1, &srvTable);
-
-    CD3DX12_STATIC_SAMPLER_DESC sampler(
-        0,
-        D3D12_FILTER_ANISOTROPIC,
+    CD3DX12_STATIC_SAMPLER_DESC linearWrap(0,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
         D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        0.0f, 8);
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP);
 
-    CD3DX12_ROOT_SIGNATURE_DESC rsDesc(
-        2, params, 1, &sampler,
+    CD3DX12_ROOT_SIGNATURE_DESC geomRootSigDesc(2, geomRootParameter, 1, &linearWrap,
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
-    ComPtr<ID3DBlob> blob, err;
-    HRESULT hr = D3D12SerializeRootSignature(
-        &rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-        blob.GetAddressOf(), err.GetAddressOf());
-    if (err) ::OutputDebugStringA((char*)err->GetBufferPointer());
+    ComPtr<ID3DBlob> serializedRootSig = nullptr;
+    ComPtr<ID3DBlob> errorBlob = nullptr;
+    HRESULT hr = D3D12SerializeRootSignature(&geomRootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+        serializedRootSig.GetAddressOf(), errorBlob.GetAddressOf());
+    if (errorBlob != nullptr)
+        ::OutputDebugStringA((char*)errorBlob->GetBufferPointer());
     ThrowIfFailed(hr);
 
-    ThrowIfFailed(md3dDevice->CreateRootSignature(
-        0, blob->GetBufferPointer(), blob->GetBufferSize(),
-        IID_PPV_ARGS(&mRootSignature)));
+    ThrowIfFailed(md3dDevice->CreateRootSignature(0, serializedRootSig->GetBufferPointer(),
+        serializedRootSig->GetBufferSize(), IID_PPV_ARGS(&mGeometryRootSignature)));
+
+    CD3DX12_DESCRIPTOR_RANGE lightSrvTable;
+    lightSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0);
+
+    CD3DX12_ROOT_PARAMETER lightRootParameter[2];
+    lightRootParameter[0].InitAsDescriptorTable(1, &lightSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+    lightRootParameter[1].InitAsConstantBufferView(1);
+
+    CD3DX12_ROOT_SIGNATURE_DESC lightRootSigDesc(2, lightRootParameter, 1, &linearWrap,
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+    serializedRootSig.Reset();
+    errorBlob.Reset();
+    hr = D3D12SerializeRootSignature(&lightRootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+        serializedRootSig.GetAddressOf(), errorBlob.GetAddressOf());
+    if (errorBlob != nullptr)
+        ::OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+    ThrowIfFailed(hr);
+
+    ThrowIfFailed(md3dDevice->CreateRootSignature(0, serializedRootSig->GetBufferPointer(),
+        serializedRootSig->GetBufferSize(), IID_PPV_ARGS(&mLightingRootSignature)));
 }
 
-// ===========================================================================
-//  BuildShadersAndInputLayout
-// ===========================================================================
 void BoxApp::BuildShadersAndInputLayout()
 {
-    mvsByteCode = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "VS", "vs_5_0");
-    mpsByteCode = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "PS", "ps_5_0");
+    mGBufferVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferVS", "vs_5_0");
+    mGBufferPS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferPS", "ps_5_0");
+    mLightingVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "LightingVS", "vs_5_0");
+    mLightingPS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "LightingPS", "ps_5_0");
 
     mInputLayout =
     {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
     };
 }
 
-// ===========================================================================
-//  BuildPSO
-// ===========================================================================
-void BoxApp::BuildPSO()
+void BoxApp::BuildLights()
 {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-    psoDesc.InputLayout    = { mInputLayout.data(), (UINT)mInputLayout.size() };
-    psoDesc.pRootSignature = mRootSignature.Get();
-    psoDesc.VS = { (BYTE*)mvsByteCode->GetBufferPointer(), mvsByteCode->GetBufferSize() };
-    psoDesc.PS = { (BYTE*)mpsByteCode->GetBufferPointer(), mpsByteCode->GetBufferSize() };
-    psoDesc.RasterizerState   = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-    psoDesc.BlendState        = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-    psoDesc.SampleMask        = UINT_MAX;
-    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    psoDesc.NumRenderTargets  = 1;
-    psoDesc.RTVFormats[0]     = mBackBufferFormat;
-    psoDesc.SampleDesc.Count   = m4xMsaaState ? 4 : 1;
-    psoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
-    psoDesc.DSVFormat = mDepthStencilFormat;
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&mPSO)));
+    mDeferredRenderer.Lighting.PointLights.clear();
+    mDeferredRenderer.Lighting.DirectionalLights.clear();
+    mDeferredRenderer.Lighting.SpotLights.clear();
+
+    mDeferredRenderer.Lighting.DirectionalLights.push_back({ XMFLOAT3(0.4f, -1.0f, 0.2f), 0.45f, XMFLOAT3(1.0f, 0.95f, 0.9f), 0.0f });
+
+    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(7.2f, 1.3f, 1.0f), 7.5f, XMFLOAT3(1.0f, 0.25f, 0.25f), 9.0f });
+    //mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(-1.3f, 1.1f, -0.9f), 7.5f, XMFLOAT3(0.2f, 0.65f, 1.0f), 9.0f });
+    //mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(-7.85f, 1.4f, -1.95f), 6.5f, XMFLOAT3(0.75f, 1.0f, 0.45f), 8.5f });
+
+    SpotLight s0;
+    s0.Position = XMFLOAT3(-1.0f, 1.8f, -1.3f);
+    s0.Direction = XMFLOAT3(0.0f, -0.97f, 0.24f);
+    s0.InnerCos = 0.95f;
+    s0.OuterCos = 0.88f;
+    s0.Radius = 14.0f;
+    s0.Intensity = 10.0f;
+    s0.Color = XMFLOAT3(1.0f, 0.95f, 0.75f);
+    mDeferredRenderer.Lighting.SpotLights.push_back(s0);
+
+    /*SpotLight s1;
+    s1.Position = XMFLOAT3(6.7f, 5.1f, -4.9f);
+    s1.Direction = XMFLOAT3(0.33f, -0.93f, -0.14f);
+    s1.InnerCos = 0.92f;
+    s1.OuterCos = 0.80f;
+    s1.Radius = 18.0f;
+    s1.Intensity = 12.0f;
+    s1.Color = XMFLOAT3(0.8f, 0.85f, 1.0f);
+    mDeferredRenderer.Lighting.SpotLights.push_back(s1);*/
+}
+
+void BoxApp::BuildBoxGeometry()
+{
+    std::string inputfile = "sponza-master\\sponza.obj";
+
+    tinyobj::ObjReaderConfig reader_config;
+    reader_config.triangulate = true;
+    reader_config.mtl_search_path = "sponza-master\\";
+
+    tinyobj::ObjReader reader;
+    if (!reader.ParseFromFile(inputfile, reader_config))
+    {
+        if (!reader.Error().empty())
+            OutputDebugStringA(reader.Error().c_str());
+
+        throw std::runtime_error("Failed to load sponza.obj (tinyobj).");
+    }
+
+    const auto& attrib = reader.GetAttrib();
+    const auto& shapes = reader.GetShapes();
+    const auto& materials = reader.GetMaterials();
+
+    // In sponza.mtl texture names are stored as "textures/....tga",
+    // so the base directory must point to "sponza-master", not ".../textures".
+    std::filesystem::path texBase = std::filesystem::path("sponza-master");
+
+    auto fallback = std::make_unique<Texture>();
+    fallback->Name = "__fallback";
+    fallback->Filename = L"";
+    D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1);
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE,
+        &texDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(fallback->Resource.GetAddressOf())));
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD), D3D12_HEAP_FLAG_NONE,
+        &CD3DX12_RESOURCE_DESC::Buffer(1024), D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(fallback->UploadHeap.GetAddressOf())));
+    uint32_t white = 0xFFFFFFFF;
+    D3D12_SUBRESOURCE_DATA srd = { &white, 4, 4 };
+    UpdateSubresources(mCommandList.Get(), fallback->Resource.Get(), fallback->UploadHeap.Get(), 0, 0, 1, &srd);
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(fallback->Resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+    mTextureIndexByName[fallback->Name] = 0;
+    mTextures.push_back(std::move(fallback));
+
+    struct BatchKey
+    {
+        int MaterialId = -1;
+        size_t ShapeIndex = 0;
+
+        bool operator==(const BatchKey& rhs) const
+        {
+            return MaterialId == rhs.MaterialId && ShapeIndex == rhs.ShapeIndex;
+        }
+    };
+
+    struct BatchKeyHash
+    {
+        size_t operator()(const BatchKey& key) const
+        {
+            size_t h1 = std::hash<int>{}(key.MaterialId);
+            size_t h2 = std::hash<size_t>{}(key.ShapeIndex);
+            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+        }
+    };
+
+    struct BatchBucket
+    {
+        UINT SrvIndex = 0;
+        XMFLOAT4 Tint = XMFLOAT4(1, 1, 1, 1);
+        std::vector<Vertex> Vertices;
+        std::vector<std::uint32_t> LocalIndices;
+    };
+
+    std::unordered_map<BatchKey, BatchBucket, BatchKeyHash> buckets;
+    std::vector<BatchKey> batchOrder;
+    mDrawBatches.clear();
+
+    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
+    {
+        const auto& shape = shapes[shapeIndex];
+        size_t faceOffset = 0;
+
+        for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f)
+        {
+            const int fv = shape.mesh.num_face_vertices[f];
+            const int materialId = (f < shape.mesh.material_ids.size()) ? shape.mesh.material_ids[f] : -1;
+            const BatchKey key{ materialId, shapeIndex };
+
+            auto it = buckets.find(key);
+            if (it == buckets.end())
+            {
+                BatchBucket bucket;
+                if (materialId >= 0 && materialId < static_cast<int>(materials.size()))
+                {
+                    const auto& m = materials[materialId];
+                    if (!m.diffuse_texname.empty())
+                        bucket.SrvIndex = LoadOrCreateTexture(texBase, m.diffuse_texname);
+                    bucket.Tint = XMFLOAT4(m.diffuse[0], m.diffuse[1], m.diffuse[2], 1.0f);
+                }
+
+                auto inserted = buckets.emplace(key, std::move(bucket));
+                it = inserted.first;
+                batchOrder.push_back(key);
+            }
+
+            BatchBucket& bucket = it->second;
+            for (int v = 0; v < fv; ++v)
+            {
+                const auto& idx = shape.mesh.indices[faceOffset + v];
+                Vertex vert = {};
+                vert.Pos.x = attrib.vertices[3 * idx.vertex_index + 0] * 0.01f;
+                vert.Pos.y = attrib.vertices[3 * idx.vertex_index + 1] * 0.01f;
+                vert.Pos.z = attrib.vertices[3 * idx.vertex_index + 2] * 0.01f;
+                if (idx.normal_index >= 0 && !attrib.normals.empty())
+                {
+                    vert.Normal.x = attrib.normals[3 * idx.normal_index + 0];
+                    vert.Normal.y = attrib.normals[3 * idx.normal_index + 1];
+                    vert.Normal.z = attrib.normals[3 * idx.normal_index + 2];
+                }
+                else
+                {
+                    vert.Normal = XMFLOAT3(0, 1, 0);
+                }
+
+                if (idx.texcoord_index >= 0 && !attrib.texcoords.empty())
+                {
+                    vert.TexC.x = attrib.texcoords[2 * idx.texcoord_index + 0];
+                    vert.TexC.y = 1.0f - attrib.texcoords[2 * idx.texcoord_index + 1];
+                }
+                else
+                {
+                    vert.TexC = XMFLOAT2(0, 0);
+                }
+
+                bucket.Vertices.push_back(vert);
+                bucket.LocalIndices.push_back(static_cast<uint32_t>(bucket.Vertices.size() - 1));
+            }
+
+            faceOffset += fv;
+        }
+    }
+
+    std::vector<Vertex> vertices;
+    std::vector<std::uint32_t> indices;
+    vertices.reserve(attrib.vertices.size() / 3);
+    indices.reserve(attrib.vertices.size() / 3);
+
+    for (const BatchKey& key : batchOrder)
+    {
+        BatchBucket& bucket = buckets[key];
+        DrawBatch batch;
+        batch.StartIndexLocation = static_cast<UINT>(indices.size());
+        batch.SrvIndex = bucket.SrvIndex;
+        batch.Tint = bucket.Tint;
+
+        const uint32_t baseVertex = static_cast<uint32_t>(vertices.size());
+        vertices.insert(vertices.end(), bucket.Vertices.begin(), bucket.Vertices.end());
+        for (uint32_t localIndex : bucket.LocalIndices)
+            indices.push_back(baseVertex + localIndex);
+
+        batch.IndexCount = static_cast<UINT>(bucket.LocalIndices.size());
+        mDrawBatches.push_back(batch);
+    }
+
+    const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
+    const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint32_t);
+
+    mBoxGeo = std::make_unique<MeshGeometry>();
+    mBoxGeo->Name = "sponzaGeo";
+
+    ThrowIfFailed(D3DCreateBlob(vbByteSize, &mBoxGeo->VertexBufferCPU));
+    CopyMemory(mBoxGeo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
+
+    ThrowIfFailed(D3DCreateBlob(ibByteSize, &mBoxGeo->IndexBufferCPU));
+    CopyMemory(mBoxGeo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
+
+    mBoxGeo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(
+        md3dDevice.Get(), mCommandList.Get(),
+        vertices.data(), vbByteSize,
+        mBoxGeo->VertexBufferUploader);
+
+    mBoxGeo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(
+        md3dDevice.Get(), mCommandList.Get(),
+        indices.data(), ibByteSize,
+        mBoxGeo->IndexBufferUploader);
+
+    mBoxGeo->VertexByteStride = sizeof(Vertex);
+    mBoxGeo->VertexBufferByteSize = vbByteSize;
+
+    mBoxGeo->IndexFormat = DXGI_FORMAT_R32_UINT;
+    mBoxGeo->IndexBufferByteSize = ibByteSize;
+}
+
+void BoxApp::BuildPSOs()
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gbufferPsoDesc = {};
+    gbufferPsoDesc.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
+    gbufferPsoDesc.pRootSignature = mGeometryRootSignature.Get();
+    gbufferPsoDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(mGBufferVS->GetBufferPointer()),
+        mGBufferVS->GetBufferSize()
+    };
+    gbufferPsoDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(mGBufferPS->GetBufferPointer()),
+        mGBufferPS->GetBufferSize()
+    };
+    gbufferPsoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    gbufferPsoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    gbufferPsoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    gbufferPsoDesc.SampleMask = UINT_MAX;
+    gbufferPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    gbufferPsoDesc.NumRenderTargets = 2;
+    gbufferPsoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    gbufferPsoDesc.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    gbufferPsoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
+    gbufferPsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
+    gbufferPsoDesc.DSVFormat = mDepthStencilFormat;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&gbufferPsoDesc, IID_PPV_ARGS(&mGBufferPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC lightPsoDesc = {};
+    lightPsoDesc.InputLayout = { nullptr, 0 };
+    lightPsoDesc.pRootSignature = mLightingRootSignature.Get();
+    lightPsoDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(mLightingVS->GetBufferPointer()),
+        mLightingVS->GetBufferSize()
+    };
+    lightPsoDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(mLightingPS->GetBufferPointer()),
+        mLightingPS->GetBufferSize()
+    };
+    lightPsoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    lightPsoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    lightPsoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    lightPsoDesc.DepthStencilState.DepthEnable = FALSE;
+    lightPsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    lightPsoDesc.SampleMask = UINT_MAX;
+    lightPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    lightPsoDesc.NumRenderTargets = 1;
+    lightPsoDesc.RTVFormats[0] = mBackBufferFormat;
+    lightPsoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
+    lightPsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
+    lightPsoDesc.DSVFormat = mDepthStencilFormat;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&lightPsoDesc, IID_PPV_ARGS(&mLightingPSO)));
 }

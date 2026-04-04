@@ -597,6 +597,10 @@ void D3DApp::CalculateFrameStats()
             L"    fps: " + fpsStr +
             L"   mspf: " + mspfStr;
 
+        wstring additionalText = GetAdditionalWindowText();
+        if (!additionalText.empty())
+            windowText += L"   " + additionalText;
+
         SetWindowText(mhMainWnd, windowText.c_str());
 		
 		// Reset for next average.
