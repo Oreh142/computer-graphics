@@ -43,8 +43,8 @@ struct DeferredPassConstants
     UINT PointLightCount = 0;
     UINT DirectionalLightCount = 0;
     UINT SpotLightCount = 0;
+    UINT DebugView = 0;
     float Ambient = 0.001f;
-    float Padding0 = 0.0f;
     PointLight PointLights[16];
     DirectionalLight DirectionalLights[8];
     SpotLight SpotLights[8];

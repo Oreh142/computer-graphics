@@ -38,7 +38,7 @@ void GBuffer::Resize(ID3D12Device* device, UINT width, UINT height)
         return;
 
     mAlbedo.Reset();
-    mNormalDepth.Reset();
+    mNormal.Reset();
     mWidth = width;
     mHeight = height;
 
@@ -56,9 +56,9 @@ ID3D12Resource* GBuffer::AlbedoResource() const
     return mAlbedo.Get();
 }
 
-ID3D12Resource* GBuffer::NormalDepthResource() const
+ID3D12Resource* GBuffer::NormalResource() const
 {
-    return mNormalDepth.Get();
+    return mNormal.Get();
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE GBuffer::AlbedoRtv() const
@@ -66,15 +66,15 @@ D3D12_CPU_DESCRIPTOR_HANDLE GBuffer::AlbedoRtv() const
     return mAlbedoRtv;
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE GBuffer::NormalDepthRtv() const
+D3D12_CPU_DESCRIPTOR_HANDLE GBuffer::NormalRtv() const
 {
-    return mNormalDepthRtv;
+    return mNormalRtv;
 }
 
 void GBuffer::CreateTextures(ID3D12Device* device)
 {
     auto albedoDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, mWidth, mHeight, 1, 1);
-    auto normalDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16B16A16_FLOAT, mWidth, mHeight, 1, 1);
+    auto normalDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16_FLOAT, mWidth, mHeight, 1, 1);
     albedoDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     normalDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
@@ -84,8 +84,11 @@ void GBuffer::CreateTextures(ID3D12Device* device)
     std::copy(std::begin(black), std::end(black), std::begin(albedoClear.Color));
 
     D3D12_CLEAR_VALUE normalClear = {};
-    normalClear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    std::copy(std::begin(black), std::end(black), std::begin(normalClear.Color));
+    normalClear.Format = DXGI_FORMAT_R16G16_FLOAT;
+    normalClear.Color[0] = 0.5f;
+    normalClear.Color[1] = 0.5f;
+    normalClear.Color[2] = 0.0f;
+    normalClear.Color[3] = 1.0f;
 
     ThrowIfFailed(device->CreateCommittedResource(
         &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
@@ -101,7 +104,8 @@ void GBuffer::CreateTextures(ID3D12Device* device)
         &normalDesc,
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         &normalClear,
-        IID_PPV_ARGS(&mNormalDepth)));
+        IID_PPV_ARGS(&mNormal)));
+
 }
 
 void GBuffer::CreateViews(ID3D12Device* device)
@@ -110,11 +114,11 @@ void GBuffer::CreateViews(ID3D12Device* device)
 
     UINT rtvSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     mAlbedoRtv = mRtvHeap->GetCPUDescriptorHandleForHeapStart();
-    mNormalDepthRtv = mAlbedoRtv;
-    mNormalDepthRtv.ptr += rtvSize;
+    mNormalRtv = mAlbedoRtv;
+    mNormalRtv.ptr += rtvSize;
 
     device->CreateRenderTargetView(mAlbedo.Get(), nullptr, mAlbedoRtv);
-    device->CreateRenderTargetView(mNormalDepth.Get(), nullptr, mNormalDepthRtv);
+    device->CreateRenderTargetView(mNormal.Get(), nullptr, mNormalRtv);
 
     auto srvCpu = mSrvHeap->GetCPUDescriptorHandleForHeapStart();
     UINT srvSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -125,9 +129,9 @@ void GBuffer::CreateViews(ID3D12Device* device)
     albedoSrv.Texture2D.MipLevels = 1;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC normalSrv = albedoSrv;
-    normalSrv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    normalSrv.Format = DXGI_FORMAT_R16G16_FLOAT;
 
     device->CreateShaderResourceView(mAlbedo.Get(), &albedoSrv, srvCpu);
     srvCpu.ptr += srvSize;
-    device->CreateShaderResourceView(mNormalDepth.Get(), &normalSrv, srvCpu);
+    device->CreateShaderResourceView(mNormal.Get(), &normalSrv, srvCpu);
 }

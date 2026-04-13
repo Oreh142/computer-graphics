@@ -20,6 +20,7 @@
 #include <cassert>
 #include <sstream>
 #include <iomanip>
+#include <array>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -131,6 +132,8 @@ private:
     virtual void OnMouseMove(WPARAM btnState, int x, int y)override;
 
     void BuildDescriptorHeaps();
+    void BuildDeferredSrvHeap();
+    void UpdateDeferredSrvDescriptors();
     void BuildConstantBuffers();
     void BuildRootSignatures();
     void BuildShadersAndInputLayout();
@@ -151,6 +154,7 @@ private:
     ComPtr<ID3D12RootSignature> mGeometryRootSignature = nullptr;
     ComPtr<ID3D12RootSignature> mLightingRootSignature = nullptr;
     ComPtr<ID3D12DescriptorHeap> mCbvSrvHeap = nullptr;
+    ComPtr<ID3D12DescriptorHeap> mDeferredSrvHeap = nullptr;
 
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB = nullptr;
     std::unique_ptr<UploadBuffer<DeferredPassConstants>> mDeferredCB = nullptr;
@@ -179,6 +183,8 @@ private:
     float mUvTile = 1.0f;
     float mUvAnimSpeedU = 0.1f;
     float mUvAnimSpeedV = 0.05f;
+    UINT mDebugView = 0;
+    bool mDebugViewKeyWasDown = false;
 
     POINT mLastMousePos;
 };
@@ -226,9 +232,11 @@ bool BoxApp::Initialize()
     BuildBoxGeometry();
     BuildConstantBuffers();
     BuildDescriptorHeaps();
+    BuildDeferredSrvHeap();
     BuildRootSignatures();
     BuildPSOs();
     mDeferredRenderer.Buffers.Build(md3dDevice.Get(), mClientWidth, mClientHeight);
+    UpdateDeferredSrvDescriptors();
     BuildLights();
 
     ThrowIfFailed(mCommandList->Close());
@@ -245,16 +253,27 @@ void BoxApp::OnResize()
 
     mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
     if (mDeferredRenderer.Buffers.IsInitialized())
+    {
         mDeferredRenderer.Buffers.Resize(md3dDevice.Get(), mClientWidth, mClientHeight);
+        UpdateDeferredSrvDescriptors();
+    }
 }
 
 std::wstring BoxApp::GetAdditionalWindowText() const
 {
     const XMFLOAT3 cameraPos = mCamera.GetPosition3f();
+    static const std::array<const wchar_t*, 4> kDebugViewNames =
+    {
+        L"Lit",
+        L"Albedo",
+        L"Normal",
+        L"Depth"
+    };
 
     std::wostringstream stream;
     stream << std::fixed << std::setprecision(2)
-           << L"cam xyz: (" << cameraPos.x << L", " << cameraPos.y << L", " << cameraPos.z << L")";
+           << L"cam xyz: (" << cameraPos.x << L", " << cameraPos.y << L", " << cameraPos.z << L")"
+           << L" | debug: " << kDebugViewNames[mDebugView];
 
     return stream.str();
 }
@@ -272,6 +291,11 @@ void BoxApp::Update(const GameTimer& gt)
         mCamera.Strafe(-moveStep);
     if (d3dUtil::IsKeyDown('D'))
         mCamera.Strafe(moveStep);
+
+    const bool debugKeyDown = d3dUtil::IsKeyDown('G');
+    if (debugKeyDown && !mDebugViewKeyWasDown)
+        mDebugView = (mDebugView + 1) % 4;
+    mDebugViewKeyWasDown = debugKeyDown;
 
     mCamera.UpdateViewMatrix();
 
@@ -296,6 +320,7 @@ void BoxApp::Update(const GameTimer& gt)
     pass.PointLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.PointLights.size(), 16));
     pass.DirectionalLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.DirectionalLights.size(), 8));
     pass.SpotLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.SpotLights.size(), 8));
+    pass.DebugView = mDebugView;
 
     for (UINT i = 0; i < pass.PointLightCount; ++i)
         pass.PointLights[i] = mDeferredRenderer.Lighting.PointLights[i];
@@ -312,7 +337,8 @@ void BoxApp::Draw(const GameTimer& gt)
     ThrowIfFailed(mDirectCmdListAlloc->Reset());
 
     auto* albedo = mDeferredRenderer.Buffers.AlbedoResource();
-    auto* normalDepth = mDeferredRenderer.Buffers.NormalDepthResource();
+    auto* normal = mDeferredRenderer.Buffers.NormalResource();
+    auto* depth = mDepthStencilBuffer.Get();
 
     ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), mGBufferPSO.Get()));
     mCommandList->RSSetViewports(1, &mScreenViewport);
@@ -321,15 +347,15 @@ void BoxApp::Draw(const GameTimer& gt)
     CD3DX12_RESOURCE_BARRIER preGeom[2] =
     {
         CD3DX12_RESOURCE_BARRIER::Transition(albedo, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
-        CD3DX12_RESOURCE_BARRIER::Transition(normalDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)
+        CD3DX12_RESOURCE_BARRIER::Transition(normal, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)
     };
     mCommandList->ResourceBarrier(2, preGeom);
 
     mCommandList->ClearRenderTargetView(mDeferredRenderer.Buffers.AlbedoRtv(), Colors::Black, 0, nullptr);
-    mCommandList->ClearRenderTargetView(mDeferredRenderer.Buffers.NormalDepthRtv(), Colors::Black, 0, nullptr);
+    mCommandList->ClearRenderTargetView(mDeferredRenderer.Buffers.NormalRtv(), Colors::Black, 0, nullptr);
     mCommandList->ClearDepthStencilView(DepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE gbuffers[2] = { mDeferredRenderer.Buffers.AlbedoRtv(), mDeferredRenderer.Buffers.NormalDepthRtv() };
+    D3D12_CPU_DESCRIPTOR_HANDLE gbuffers[2] = { mDeferredRenderer.Buffers.AlbedoRtv(), mDeferredRenderer.Buffers.NormalRtv() };
     mCommandList->OMSetRenderTargets(2, gbuffers, false, &DepthStencilView());
 
     ID3D12DescriptorHeap* geomHeaps[] = { mCbvSrvHeap.Get() };
@@ -364,13 +390,14 @@ void BoxApp::Draw(const GameTimer& gt)
         mCommandList->DrawIndexedInstanced(batch.IndexCount, 1, batch.StartIndexLocation, 0, 0);
     }
 
-    CD3DX12_RESOURCE_BARRIER toLighting[3] =
+    CD3DX12_RESOURCE_BARRIER toLighting[4] =
     {
         CD3DX12_RESOURCE_BARRIER::Transition(albedo, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-        CD3DX12_RESOURCE_BARRIER::Transition(normalDepth, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(normal, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
         CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)
     };
-    mCommandList->ResourceBarrier(3, toLighting);
+    mCommandList->ResourceBarrier(4, toLighting);
 
     mCommandList->SetPipelineState(mLightingPSO.Get());
     mCommandList->SetGraphicsRootSignature(mLightingRootSignature.Get());
@@ -378,17 +405,21 @@ void BoxApp::Draw(const GameTimer& gt)
     mCommandList->ClearRenderTargetView(backBufferRtv, Colors::Black, 0, nullptr);
     mCommandList->OMSetRenderTargets(1, &backBufferRtv, true, nullptr);
 
-    ID3D12DescriptorHeap* lightHeaps[] = { mDeferredRenderer.Buffers.SrvHeap() };
+    ID3D12DescriptorHeap* lightHeaps[] = { mDeferredSrvHeap.Get() };
     mCommandList->SetDescriptorHeaps(_countof(lightHeaps), lightHeaps);
-    mCommandList->SetGraphicsRootDescriptorTable(0, mDeferredRenderer.Buffers.SrvHeap()->GetGPUDescriptorHandleForHeapStart());
+    mCommandList->SetGraphicsRootDescriptorTable(0, mDeferredSrvHeap->GetGPUDescriptorHandleForHeapStart());
     mCommandList->SetGraphicsRootConstantBufferView(1, mDeferredCB->Resource()->GetGPUVirtualAddress());
     mCommandList->IASetVertexBuffers(0, 0, nullptr);
     mCommandList->IASetIndexBuffer(nullptr);
     mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     mCommandList->DrawInstanced(3, 1, 0, 0);
 
-    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
-        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
+    CD3DX12_RESOURCE_BARRIER endFrame[2] =
+    {
+        CD3DX12_RESOURCE_BARRIER::Transition(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)
+    };
+    mCommandList->ResourceBarrier(2, endFrame);
 
     ThrowIfFailed(mCommandList->Close());
 
@@ -522,6 +553,47 @@ void BoxApp::BuildDescriptorHeaps()
     }
 }
 
+void BoxApp::BuildDeferredSrvHeap()
+{
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.NumDescriptors = 3;
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.NodeMask = 0;
+    ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mDeferredSrvHeap)));
+}
+
+void BoxApp::UpdateDeferredSrvDescriptors()
+{
+    ID3D12Resource* albedo = mDeferredRenderer.Buffers.AlbedoResource();
+    ID3D12Resource* normal = mDeferredRenderer.Buffers.NormalResource();
+    ID3D12Resource* depth = mDepthStencilBuffer.Get();
+    assert(albedo && normal && depth);
+
+    auto dstCpu = mDeferredSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    const UINT descriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC albedoSrv = {};
+    albedoSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    albedoSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    albedoSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    albedoSrv.Texture2D.MipLevels = 1;
+    md3dDevice->CreateShaderResourceView(albedo, &albedoSrv, dstCpu);
+    dstCpu.ptr += descriptorSize;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC normalSrv = albedoSrv;
+    normalSrv.Format = DXGI_FORMAT_R16G16_FLOAT;
+    md3dDevice->CreateShaderResourceView(normal, &normalSrv, dstCpu);
+    dstCpu.ptr += descriptorSize;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = {};
+    depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depthSrv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depthSrv.Texture2D.MipLevels = 1;
+    md3dDevice->CreateShaderResourceView(depth, &depthSrv, dstCpu);
+}
+
 void BoxApp::BuildConstantBuffers()
 {
     mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), 1, true);
@@ -558,7 +630,7 @@ void BoxApp::BuildRootSignatures()
         serializedRootSig->GetBufferSize(), IID_PPV_ARGS(&mGeometryRootSignature)));
 
     CD3DX12_DESCRIPTOR_RANGE lightSrvTable;
-    lightSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0);
+    lightSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0);
 
     CD3DX12_ROOT_PARAMETER lightRootParameter[2];
     lightRootParameter[0].InitAsDescriptorTable(1, &lightSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
@@ -838,7 +910,7 @@ void BoxApp::BuildPSOs()
     gbufferPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     gbufferPsoDesc.NumRenderTargets = 2;
     gbufferPsoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    gbufferPsoDesc.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    gbufferPsoDesc.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
     gbufferPsoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
     gbufferPsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
     gbufferPsoDesc.DSVFormat = mDepthStencilFormat;

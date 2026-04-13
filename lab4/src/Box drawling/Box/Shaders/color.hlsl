@@ -20,8 +20,30 @@ struct VertexIn
 struct GBufferOut
 {
     float4 Albedo : SV_Target0;
-    float4 NormalDepth : SV_Target1;
+    float2 NormalRG : SV_Target1;
 };
+
+float2 EncodeOctahedron(float3 n)
+{
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 enc = n.xy;
+    if (n.z < 0.0f)
+    {
+        float2 signVal = float2(enc.x >= 0.0f ? 1.0f : -1.0f, enc.y >= 0.0f ? 1.0f : -1.0f);
+        enc = (1.0f - abs(enc.yx)) * signVal;
+    }
+    return enc * 0.5f + 0.5f;
+}
+
+float3 DecodeOctahedron(float2 enc)
+{
+    float2 f = enc * 2.0f - 1.0f;
+    float3 n = float3(f.x, f.y, 1.0f - abs(f.x) - abs(f.y));
+    float t = saturate(-n.z);
+    n.x += (n.x >= 0.0f) ? -t : t;
+    n.y += (n.y >= 0.0f) ? -t : t;
+    return normalize(n);
+}
 
 struct VertexOut
 {
@@ -45,7 +67,7 @@ GBufferOut GBufferPS(VertexOut pin)
     GBufferOut o;
     float4 albedo = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC) * gTint;
     o.Albedo = albedo;
-    o.NormalDepth = float4(normalize(pin.NormalW) * 0.5f + 0.5f, pin.PosH.z);
+    o.NormalRG = EncodeOctahedron(normalize(pin.NormalW));
     return o;
 }
 
@@ -65,7 +87,8 @@ FSOut LightingVS(uint vid : SV_VertexID)
 }
 
 Texture2D gAlbedoMap : register(t0);
-Texture2D gNormalDepthMap : register(t1);
+Texture2D gNormalMap : register(t1);
+Texture2D gDepthMap : register(t2);
 
 #define MAX_POINT_LIGHTS 16
 #define MAX_DIRECTIONAL_LIGHTS 8
@@ -107,8 +130,8 @@ cbuffer cbLighting : register(b1)
     uint gPointLightCount;
     uint gDirectionalLightCount;
     uint gSpotLightCount;
+    uint gDebugView;
     float gAmbient;
-    float gPadding0;
 
     PointLight gPointLights[MAX_POINT_LIGHTS];
     DirectionalLight gDirectionalLights[MAX_DIRECTIONAL_LIGHTS];
@@ -170,11 +193,18 @@ float3 EvaluateSpotLight(float3 albedo, float3 normalW, float3 posW, SpotLight l
 float4 LightingPS(FSOut pin) : SV_Target
 {
     float4 albedo = gAlbedoMap.Sample(gsamLinearWrap, pin.Uv);
-    float4 nd = gNormalDepthMap.Sample(gsamLinearWrap, pin.Uv);
+    float2 normalTex = gNormalMap.Sample(gsamLinearWrap, pin.Uv).rg;
+    float depthNdc = gDepthMap.Sample(gsamLinearWrap, pin.Uv).r;
 
-    float3 normalW = normalize(nd.xyz * 2.0f - 1.0f);
-    float depthNdc = nd.w;
+    float3 normalW = DecodeOctahedron(normalTex);
     float3 posW = ReconstructWorldPos(pin.Uv, depthNdc);
+
+    if (gDebugView == 1)
+        return float4(albedo.rgb, 1.0f);
+    if (gDebugView == 2)
+        return float4(normalW * 0.5f + 0.5f, 1.0f);
+    if (gDebugView == 3)
+        return float4(depthNdc.xxx, 1.0f);
 
     float3 result = albedo.rgb * gAmbient;
 
