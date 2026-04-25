@@ -3,6 +3,7 @@
 #include "../../Common/UploadBuffer.h"
 #include "../../Common/d3dUtil.h"
 #include "../../Common/FreeCamera.h"
+#include "../../Common/GeometryGenerator.h"
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
@@ -21,6 +22,7 @@
 #include <sstream>
 #include <iomanip>
 #include <array>
+#include <cmath>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -29,16 +31,23 @@ struct Vertex
 {
     XMFLOAT3 Pos;
     XMFLOAT3 Normal;
+    XMFLOAT3 Tangent;
     XMFLOAT2 TexC;
 };
 
 struct ObjectConstants
 {
     XMFLOAT4X4 World = MathHelper::Identity4x4();
-    XMFLOAT4X4 WorldViewProj = MathHelper::Identity4x4();
+    XMFLOAT4X4 ViewProj = MathHelper::Identity4x4();
     XMFLOAT2 UvScale = XMFLOAT2(1.0f, 1.0f);
     XMFLOAT2 UvOffset = XMFLOAT2(0.0f, 0.0f);
     XMFLOAT4 Tint = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+    XMFLOAT3 CameraPosW = XMFLOAT3(0.0f, 0.0f, 0.0f);
+    float DisplacementScale = 0.0f;
+    float TessMinDistance = 3.0f;
+    float TessMaxDistance = 18.0f;
+    float TessMinFactor = 1.0f;
+    float TessMaxFactor = 12.0f;
 };
 
 struct TgaImage
@@ -103,6 +112,85 @@ static TgaImage LoadTgaRgba(const std::wstring& filePath)
     return img;
 }
 
+namespace
+{
+    XMFLOAT3 BuildFallbackTangent(const XMFLOAT3& normal)
+    {
+        XMVECTOR n = XMVector3Normalize(XMLoadFloat3(&normal));
+        XMVECTOR ref = (std::fabs(normal.y) > 0.99f) ? XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f) : XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        XMVECTOR tangent = XMVector3Cross(ref, n);
+        if (XMVectorGetX(XMVector3LengthSq(tangent)) < 1e-8f)
+            tangent = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+
+        XMFLOAT3 result;
+        XMStoreFloat3(&result, XMVector3Normalize(tangent));
+        return result;
+    }
+
+    void ComputeTangents(std::vector<Vertex>& vertices, const std::vector<std::uint32_t>& indices)
+    {
+        std::vector<XMFLOAT3> accumulated(vertices.size(), XMFLOAT3(0.0f, 0.0f, 0.0f));
+
+        for (size_t i = 0; i + 2 < indices.size(); i += 3)
+        {
+            const uint32_t i0 = indices[i + 0];
+            const uint32_t i1 = indices[i + 1];
+            const uint32_t i2 = indices[i + 2];
+
+            const Vertex& v0 = vertices[i0];
+            const Vertex& v1 = vertices[i1];
+            const Vertex& v2 = vertices[i2];
+
+            const XMVECTOR p0 = XMLoadFloat3(&v0.Pos);
+            const XMVECTOR p1 = XMLoadFloat3(&v1.Pos);
+            const XMVECTOR p2 = XMLoadFloat3(&v2.Pos);
+
+            const XMVECTOR e1 = p1 - p0;
+            const XMVECTOR e2 = p2 - p0;
+
+            const float du1 = v1.TexC.x - v0.TexC.x;
+            const float dv1 = v1.TexC.y - v0.TexC.y;
+            const float du2 = v2.TexC.x - v0.TexC.x;
+            const float dv2 = v2.TexC.y - v0.TexC.y;
+
+            XMVECTOR tangent = XMVectorZero();
+            const float denom = du1 * dv2 - dv1 * du2;
+            if (std::fabs(denom) > 1e-6f)
+            {
+                tangent = (e1 * dv2 - e2 * dv1) / denom;
+            }
+            else
+            {
+                tangent = XMLoadFloat3(&BuildFallbackTangent(v0.Normal));
+            }
+
+            XMFLOAT3 tangentF;
+            XMStoreFloat3(&tangentF, tangent);
+
+            accumulated[i0].x += tangentF.x;
+            accumulated[i0].y += tangentF.y;
+            accumulated[i0].z += tangentF.z;
+            accumulated[i1].x += tangentF.x;
+            accumulated[i1].y += tangentF.y;
+            accumulated[i1].z += tangentF.z;
+            accumulated[i2].x += tangentF.x;
+            accumulated[i2].y += tangentF.y;
+            accumulated[i2].z += tangentF.z;
+        }
+
+        for (size_t i = 0; i < vertices.size(); ++i)
+        {
+            const XMVECTOR normal = XMVector3Normalize(XMLoadFloat3(&vertices[i].Normal));
+            XMVECTOR tangent = XMLoadFloat3(&accumulated[i]);
+            tangent = tangent - normal * XMVector3Dot(normal, tangent);
+
+            if (XMVectorGetX(XMVector3LengthSq(tangent)) < 1e-8f)
+                tangent = XMLoadFloat3(&BuildFallbackTangent(vertices[i].Normal));
+
+            XMStoreFloat3(&vertices[i].Tangent, XMVector3Normalize(tangent));
+        }
+    }
+}
 
 class DeferredRenderer
 {
@@ -140,6 +228,7 @@ private:
     void BuildBoxGeometry();
     void BuildPSOs();
     void BuildLights();
+    UINT CreateSolidColorTexture(const std::string& name, const std::array<std::uint8_t, 4>& rgba);
     UINT LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName);
 
 private:
@@ -147,8 +236,15 @@ private:
     {
         UINT IndexCount = 0;
         UINT StartIndexLocation = 0;
-        UINT SrvIndex = 0;
-        XMFLOAT4 Tint = XMFLOAT4(1, 1, 1, 1);
+        UINT DiffuseSrvIndex = 0;
+        UINT NormalSrvIndex = 0;
+        UINT DisplacementSrvIndex = 0;
+        bool Tessellated = false;
+        XMFLOAT2 UvScale = XMFLOAT2(1.0f, 1.0f);
+        float DisplacementScale = 0.0f;
+        float Padding = 0.0f;
+        XMFLOAT4 Tint = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+        XMFLOAT4X4 World = MathHelper::Identity4x4();
     };
 
     ComPtr<ID3D12RootSignature> mGeometryRootSignature = nullptr;
@@ -167,24 +263,33 @@ private:
 
     ComPtr<ID3DBlob> mGBufferVS = nullptr;
     ComPtr<ID3DBlob> mGBufferPS = nullptr;
+    ComPtr<ID3DBlob> mGBufferTessVS = nullptr;
+    ComPtr<ID3DBlob> mGBufferHS = nullptr;
+    ComPtr<ID3DBlob> mGBufferDS = nullptr;
     ComPtr<ID3DBlob> mLightingVS = nullptr;
     ComPtr<ID3DBlob> mLightingPS = nullptr;
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
 
     ComPtr<ID3D12PipelineState> mGBufferPSO = nullptr;
+    ComPtr<ID3D12PipelineState> mGBufferTessPSO = nullptr;
     ComPtr<ID3D12PipelineState> mLightingPSO = nullptr;
 
-    XMFLOAT4X4 mWorld = MathHelper::Identity4x4();
     FreeCamera mCamera;
     float mMoveSpeed = 10.0f;
     float mLookSpeed = 2.0f;
 
-    float mUvTile = 1.0f;
-    float mUvAnimSpeedU = 0.1f;
-    float mUvAnimSpeedV = 0.05f;
     UINT mDebugView = 0;
     bool mDebugViewKeyWasDown = false;
+    bool mTextureAnimationEnabled = true;
+    bool mTextureAnimationKeyWasDown = false;
+    float mUvAnimSpeedU = 0.1f;
+    float mUvAnimSpeedV = 0.05f;
+    XMFLOAT2 mAnimatedUvOffset = XMFLOAT2(0.0f, 0.0f);
+    float mTessMinDistance = 3.0f;
+    float mTessMaxDistance = 20.0f;
+    float mTessMinFactor = 1.0f;
+    float mTessMaxFactor = 12.0f;
 
     POINT mLastMousePos;
 };
@@ -214,7 +319,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
 BoxApp::BoxApp(HINSTANCE hInstance)
     : D3DApp(hInstance)
 {
-    mCamera.SetPosition(0.0f, 2.0f, -8.0f);
+    mCamera.SetPosition(0.0f, 2.2f, -8.5f);
 }
 
 BoxApp::~BoxApp()
@@ -273,7 +378,8 @@ std::wstring BoxApp::GetAdditionalWindowText() const
     std::wostringstream stream;
     stream << std::fixed << std::setprecision(2)
            << L"cam xyz: (" << cameraPos.x << L", " << cameraPos.y << L", " << cameraPos.z << L")"
-           << L" | debug: " << kDebugViewNames[mDebugView];
+           << L" | debug: " << kDebugViewNames[mDebugView]
+           << L" | tess range: [" << mTessMinDistance << L", " << mTessMaxDistance << L"]";
 
     return stream.str();
 }
@@ -297,26 +403,50 @@ void BoxApp::Update(const GameTimer& gt)
         mDebugView = (mDebugView + 1) % 4;
     mDebugViewKeyWasDown = debugKeyDown;
 
+    const bool textureAnimationKeyDown = d3dUtil::IsKeyDown('T');
+    if (textureAnimationKeyDown && !mTextureAnimationKeyWasDown)
+        mTextureAnimationEnabled = !mTextureAnimationEnabled;
+    mTextureAnimationKeyWasDown = textureAnimationKeyDown;
+
+    if (mTextureAnimationEnabled)
+    {
+        mAnimatedUvOffset.x += dt * mUvAnimSpeedU;
+        mAnimatedUvOffset.y += dt * mUvAnimSpeedV;
+    }
+
     mCamera.UpdateViewMatrix();
 
-    XMMATRIX world = XMLoadFloat4x4(&mWorld);
-    XMMATRIX view = mCamera.GetView();
-    XMMATRIX proj = mCamera.GetProj();
-    XMMATRIX worldViewProj = world * view * proj;
+    const XMMATRIX view = mCamera.GetView();
+    const XMMATRIX proj = mCamera.GetProj();
+    const XMMATRIX viewProj = view * proj;
+    const XMFLOAT3 cameraPos = mCamera.GetPosition3f();
 
-    ObjectConstants objConstants;
-    XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
-    XMStoreFloat4x4(&objConstants.WorldViewProj, XMMatrixTranspose(worldViewProj));
-    objConstants.UvScale = XMFLOAT2(mUvTile, mUvTile);
-    objConstants.UvOffset = XMFLOAT2(gt.TotalTime() * mUvAnimSpeedU, gt.TotalTime() * mUvAnimSpeedV);
-    mObjectCB->CopyData(0, objConstants);
+    for (size_t i = 0; i < mDrawBatches.size(); ++i)
+    {
+        const DrawBatch& batch = mDrawBatches[i];
+
+        ObjectConstants objConstants;
+        const XMMATRIX world = XMLoadFloat4x4(&batch.World);
+        XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
+        XMStoreFloat4x4(&objConstants.ViewProj, XMMatrixTranspose(viewProj));
+        objConstants.UvScale = batch.UvScale;
+        objConstants.UvOffset = mAnimatedUvOffset;
+        objConstants.Tint = batch.Tint;
+        objConstants.CameraPosW = cameraPos;
+        objConstants.DisplacementScale = batch.DisplacementScale;
+        objConstants.TessMinDistance = mTessMinDistance;
+        objConstants.TessMaxDistance = mTessMaxDistance;
+        objConstants.TessMinFactor = mTessMinFactor;
+        objConstants.TessMaxFactor = mTessMaxFactor;
+        mObjectCB->CopyData(static_cast<int>(i), objConstants);
+    }
 
     DeferredPassConstants pass = {};
-    XMMATRIX invView = XMMatrixInverse(nullptr, view);
-    XMMATRIX invProj = XMMatrixInverse(nullptr, proj);
+    const XMMATRIX invView = XMMatrixInverse(nullptr, view);
+    const XMMATRIX invProj = XMMatrixInverse(nullptr, proj);
     XMStoreFloat4x4(&pass.InvView, XMMatrixTranspose(invView));
     XMStoreFloat4x4(&pass.InvProj, XMMatrixTranspose(invProj));
-    pass.CameraPosW = mCamera.GetPosition3f();
+    pass.CameraPosW = cameraPos;
     pass.PointLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.PointLights.size(), 16));
     pass.DirectionalLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.DirectionalLights.size(), 8));
     pass.SpotLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.SpotLights.size(), 8));
@@ -351,8 +481,9 @@ void BoxApp::Draw(const GameTimer& gt)
     };
     mCommandList->ResourceBarrier(2, preGeom);
 
+    const float normalClear[4] = { 0.5f, 0.5f, 0.0f, 1.0f };
     mCommandList->ClearRenderTargetView(mDeferredRenderer.Buffers.AlbedoRtv(), Colors::Black, 0, nullptr);
-    mCommandList->ClearRenderTargetView(mDeferredRenderer.Buffers.NormalRtv(), Colors::Black, 0, nullptr);
+    mCommandList->ClearRenderTargetView(mDeferredRenderer.Buffers.NormalRtv(), normalClear, 0, nullptr);
     mCommandList->ClearDepthStencilView(DepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 
     D3D12_CPU_DESCRIPTOR_HANDLE gbuffers[2] = { mDeferredRenderer.Buffers.AlbedoRtv(), mDeferredRenderer.Buffers.NormalRtv() };
@@ -361,34 +492,42 @@ void BoxApp::Draw(const GameTimer& gt)
     ID3D12DescriptorHeap* geomHeaps[] = { mCbvSrvHeap.Get() };
     mCommandList->SetDescriptorHeaps(_countof(geomHeaps), geomHeaps);
     mCommandList->SetGraphicsRootSignature(mGeometryRootSignature.Get());
-
     mCommandList->IASetVertexBuffers(0, 1, &mBoxGeo->VertexBufferView());
     mCommandList->IASetIndexBuffer(&mBoxGeo->IndexBufferView());
-    mCommandList->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     const UINT descSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const auto baseHandle = mCbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
+    const auto baseSrvHandle = mCbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_VIRTUAL_ADDRESS objectCbAddress = mObjectCB->Resource()->GetGPUVirtualAddress();
 
-    for (const DrawBatch& batch : mDrawBatches)
+    auto drawBatches = [&](bool tessellated, ID3D12PipelineState* pso, D3D_PRIMITIVE_TOPOLOGY topology)
     {
-        ObjectConstants objConstants;
-        XMMATRIX world = XMLoadFloat4x4(&mWorld);
-        XMMATRIX view = mCamera.GetView();
-        XMMATRIX proj = mCamera.GetProj();
-        XMMATRIX worldViewProj = world * view * proj;
-        XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
-        XMStoreFloat4x4(&objConstants.WorldViewProj, XMMatrixTranspose(worldViewProj));
-        objConstants.UvScale = XMFLOAT2(mUvTile, mUvTile);
-        objConstants.UvOffset = XMFLOAT2(gt.TotalTime() * mUvAnimSpeedU, gt.TotalTime() * mUvAnimSpeedV);
-        objConstants.Tint = batch.Tint;
-        mObjectCB->CopyData(0, objConstants);
+        mCommandList->SetPipelineState(pso);
+        mCommandList->IASetPrimitiveTopology(topology);
 
-        auto srvHandle = baseHandle;
-        srvHandle.ptr += static_cast<SIZE_T>(batch.SrvIndex) * descSize;
-        mCommandList->SetGraphicsRootConstantBufferView(0, mObjectCB->Resource()->GetGPUVirtualAddress());
-        mCommandList->SetGraphicsRootDescriptorTable(1, srvHandle);
-        mCommandList->DrawIndexedInstanced(batch.IndexCount, 1, batch.StartIndexLocation, 0, 0);
-    }
+        for (size_t i = 0; i < mDrawBatches.size(); ++i)
+        {
+            const DrawBatch& batch = mDrawBatches[i];
+            if (batch.Tessellated != tessellated)
+                continue;
+
+            auto diffuseHandle = baseSrvHandle;
+            diffuseHandle.ptr += static_cast<SIZE_T>(batch.DiffuseSrvIndex) * descSize;
+            auto normalHandle = baseSrvHandle;
+            normalHandle.ptr += static_cast<SIZE_T>(batch.NormalSrvIndex) * descSize;
+            auto displacementHandle = baseSrvHandle;
+            displacementHandle.ptr += static_cast<SIZE_T>(batch.DisplacementSrvIndex) * descSize;
+
+            mCommandList->SetGraphicsRootConstantBufferView(0, objectCbAddress + static_cast<UINT64>(i) * objCBByteSize);
+            mCommandList->SetGraphicsRootDescriptorTable(1, diffuseHandle);
+            mCommandList->SetGraphicsRootDescriptorTable(2, normalHandle);
+            mCommandList->SetGraphicsRootDescriptorTable(3, displacementHandle);
+            mCommandList->DrawIndexedInstanced(batch.IndexCount, 1, batch.StartIndexLocation, 0, 0);
+        }
+    };
+
+    drawBatches(false, mGBufferPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    drawBatches(true, mGBufferTessPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
 
     CD3DX12_RESOURCE_BARRIER toLighting[4] =
     {
@@ -459,41 +598,16 @@ void BoxApp::OnMouseMove(WPARAM btnState, int x, int y)
     mLastMousePos.y = y;
 }
 
-UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName)
+UINT BoxApp::CreateSolidColorTexture(const std::string& name, const std::array<std::uint8_t, 4>& rgba)
 {
-    if (texName.empty())
-        return 0;
-
-    auto it = mTextureIndexByName.find(texName);
-    if (it != mTextureIndexByName.end())
-        return it->second;
-
-    std::filesystem::path filePath = baseDir / std::filesystem::path(texName);
+    auto existing = mTextureIndexByName.find(name);
+    if (existing != mTextureIndexByName.end())
+        return existing->second;
 
     auto tex = std::make_unique<Texture>();
-    tex->Name = texName;
-    tex->Filename = filePath.wstring();
+    tex->Name = name;
 
-    if (!std::filesystem::exists(filePath))
-    {
-        throw std::runtime_error("Texture file not found: " + filePath.generic_string());
-    }
-
-    TgaImage img = LoadTgaRgba(tex->Filename);
-
-    D3D12_RESOURCE_DESC texDesc = {};
-    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texDesc.Alignment = 0;
-    texDesc.Width = static_cast<UINT>(img.Width);
-    texDesc.Height = static_cast<UINT>(img.Height);
-    texDesc.DepthOrArraySize = 1;
-    texDesc.MipLevels = 1;
-    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.SampleDesc.Quality = 0;
-    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
+    D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1);
     ThrowIfFailed(md3dDevice->CreateCommittedResource(
         &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
         D3D12_HEAP_FLAG_NONE,
@@ -502,27 +616,112 @@ UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std
         nullptr,
         IID_PPV_ARGS(tex->Resource.GetAddressOf())));
 
-    const UINT64 uploadBufferSize = GetRequiredIntermediateSize(tex->Resource.Get(), 0, 1);
     ThrowIfFailed(md3dDevice->CreateCommittedResource(
         &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
         D3D12_HEAP_FLAG_NONE,
-        &CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize),
+        &CD3DX12_RESOURCE_DESC::Buffer(1024),
         D3D12_RESOURCE_STATE_GENERIC_READ,
         nullptr,
         IID_PPV_ARGS(tex->UploadHeap.GetAddressOf())));
 
+    const D3D12_RESOURCE_STATES shaderState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     D3D12_SUBRESOURCE_DATA subresourceData = {};
-    subresourceData.pData = img.Rgba.data();
-    subresourceData.RowPitch = static_cast<LONG_PTR>(img.Width * 4);
-    subresourceData.SlicePitch = subresourceData.RowPitch * img.Height;
-
+    subresourceData.pData = rgba.data();
+    subresourceData.RowPitch = 4;
+    subresourceData.SlicePitch = 4;
     UpdateSubresources(mCommandList.Get(), tex->Resource.Get(), tex->UploadHeap.Get(), 0, 0, 1, &subresourceData);
-
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-        tex->Resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+        tex->Resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, shaderState));
 
-    UINT newIndex = static_cast<UINT>(mTextures.size());
-    mTextureIndexByName[texName] = newIndex;
+    const UINT newIndex = static_cast<UINT>(mTextures.size());
+    mTextureIndexByName[name] = newIndex;
+    mTextures.push_back(std::move(tex));
+    return newIndex;
+}
+
+UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName)
+{
+    if (texName.empty())
+        return 0;
+
+    const std::filesystem::path filePath = (baseDir / std::filesystem::path(texName)).lexically_normal();
+    const std::string cacheKey = filePath.generic_string();
+
+    auto it = mTextureIndexByName.find(cacheKey);
+    if (it != mTextureIndexByName.end())
+        return it->second;
+
+    if (!std::filesystem::exists(filePath))
+        throw std::runtime_error("Texture file not found: " + filePath.generic_string());
+
+    auto tex = std::make_unique<Texture>();
+    tex->Name = cacheKey;
+    tex->Filename = filePath.wstring();
+
+    const D3D12_RESOURCE_STATES shaderState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const std::wstring extension = filePath.extension().wstring();
+
+    if (extension == L".dds")
+    {
+        ThrowIfFailed(CreateDDSTextureFromFile12(
+            md3dDevice.Get(),
+            mCommandList.Get(),
+            tex->Filename.c_str(),
+            tex->Resource,
+            tex->UploadHeap));
+
+        mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+            tex->Resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, shaderState));
+    }
+    else if (extension == L".tga")
+    {
+        TgaImage img = LoadTgaRgba(tex->Filename);
+
+        D3D12_RESOURCE_DESC texDesc = {};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Alignment = 0;
+        texDesc.Width = static_cast<UINT>(img.Width);
+        texDesc.Height = static_cast<UINT>(img.Height);
+        texDesc.DepthOrArraySize = 1;
+        texDesc.MipLevels = 1;
+        texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.SampleDesc.Quality = 0;
+        texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        ThrowIfFailed(md3dDevice->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &texDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(tex->Resource.GetAddressOf())));
+
+        const UINT64 uploadBufferSize = GetRequiredIntermediateSize(tex->Resource.Get(), 0, 1);
+        ThrowIfFailed(md3dDevice->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+            D3D12_HEAP_FLAG_NONE,
+            &CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(tex->UploadHeap.GetAddressOf())));
+
+        D3D12_SUBRESOURCE_DATA subresourceData = {};
+        subresourceData.pData = img.Rgba.data();
+        subresourceData.RowPitch = static_cast<LONG_PTR>(img.Width * 4);
+        subresourceData.SlicePitch = subresourceData.RowPitch * img.Height;
+        UpdateSubresources(mCommandList.Get(), tex->Resource.Get(), tex->UploadHeap.Get(), 0, 0, 1, &subresourceData);
+        mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+            tex->Resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, shaderState));
+    }
+    else
+    {
+        throw std::runtime_error("Unsupported texture format: " + filePath.generic_string());
+    }
+
+    const UINT newIndex = static_cast<UINT>(mTextures.size());
+    mTextureIndexByName[cacheKey] = newIndex;
     mTextures.push_back(std::move(tex));
     return newIndex;
 }
@@ -546,7 +745,7 @@ void BoxApp::BuildDescriptorHeaps()
         srvDesc.Format = tex->Resource->GetDesc().Format;
         srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MostDetailedMip = 0;
-        srvDesc.Texture2D.MipLevels = 1;
+        srvDesc.Texture2D.MipLevels = tex->Resource->GetDesc().MipLevels;
         srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
         md3dDevice->CreateShaderResourceView(tex->Resource.Get(), &srvDesc, hCpu);
         hCpu.Offset(1, descriptorSize);
@@ -596,18 +795,23 @@ void BoxApp::UpdateDeferredSrvDescriptors()
 
 void BoxApp::BuildConstantBuffers()
 {
-    mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), 1, true);
+    const UINT objectCount = static_cast<UINT>(std::max<size_t>(1, mDrawBatches.size()));
+    mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), objectCount, true);
     mDeferredCB = std::make_unique<UploadBuffer<DeferredPassConstants>>(md3dDevice.Get(), 1, true);
 }
 
 void BoxApp::BuildRootSignatures()
 {
-    CD3DX12_DESCRIPTOR_RANGE geomSrvTable;
-    geomSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+    CD3DX12_DESCRIPTOR_RANGE geomSrvTable[3];
+    geomSrvTable[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+    geomSrvTable[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
+    geomSrvTable[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);
 
-    CD3DX12_ROOT_PARAMETER geomRootParameter[2];
+    CD3DX12_ROOT_PARAMETER geomRootParameter[4];
     geomRootParameter[0].InitAsConstantBufferView(0);
-    geomRootParameter[1].InitAsDescriptorTable(1, &geomSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+    geomRootParameter[1].InitAsDescriptorTable(1, &geomSrvTable[0], D3D12_SHADER_VISIBILITY_PIXEL);
+    geomRootParameter[2].InitAsDescriptorTable(1, &geomSrvTable[1], D3D12_SHADER_VISIBILITY_PIXEL);
+    geomRootParameter[3].InitAsDescriptorTable(1, &geomSrvTable[2], D3D12_SHADER_VISIBILITY_DOMAIN);
 
     CD3DX12_STATIC_SAMPLER_DESC linearWrap(0,
         D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -615,7 +819,7 @@ void BoxApp::BuildRootSignatures()
         D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         D3D12_TEXTURE_ADDRESS_MODE_WRAP);
 
-    CD3DX12_ROOT_SIGNATURE_DESC geomRootSigDesc(2, geomRootParameter, 1, &linearWrap,
+    CD3DX12_ROOT_SIGNATURE_DESC geomRootSigDesc(4, geomRootParameter, 1, &linearWrap,
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
     ComPtr<ID3DBlob> serializedRootSig = nullptr;
@@ -655,6 +859,9 @@ void BoxApp::BuildShadersAndInputLayout()
 {
     mGBufferVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferVS", "vs_5_0");
     mGBufferPS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferPS", "ps_5_0");
+    mGBufferTessVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferTessVS", "vs_5_0");
+    mGBufferHS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferHS", "hs_5_0");
+    mGBufferDS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferDS", "ds_5_0");
     mLightingVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "LightingVS", "vs_5_0");
     mLightingPS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "LightingPS", "ps_5_0");
 
@@ -662,7 +869,8 @@ void BoxApp::BuildShadersAndInputLayout()
     {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+        { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 36, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
     };
 }
 
@@ -672,198 +880,241 @@ void BoxApp::BuildLights()
     mDeferredRenderer.Lighting.DirectionalLights.clear();
     mDeferredRenderer.Lighting.SpotLights.clear();
 
-    mDeferredRenderer.Lighting.DirectionalLights.push_back({ XMFLOAT3(0.4f, -1.0f, 0.2f), 0.45f, XMFLOAT3(1.0f, 0.95f, 0.9f), 0.0f });
+    mDeferredRenderer.Lighting.DirectionalLights.push_back({ XMFLOAT3(0.35f, -1.0f, 0.25f), 0.45f, XMFLOAT3(1.0f, 0.96f, 0.9f), 0.0f });
 
-    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(7.2f, 1.3f, 1.0f), 7.5f, XMFLOAT3(1.0f, 0.25f, 0.25f), 9.0f });
-    //mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(-1.3f, 1.1f, -0.9f), 7.5f, XMFLOAT3(0.2f, 0.65f, 1.0f), 9.0f });
-    //mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(-7.85f, 1.4f, -1.95f), 6.5f, XMFLOAT3(0.75f, 1.0f, 0.45f), 8.5f });
+    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(-1.8f, 1.9f, -1.2f), 6.5f, XMFLOAT3(1.0f, 0.45f, 0.3f), 10.0f });
+    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(1.9f, 2.0f, -0.3f), 6.5f, XMFLOAT3(0.25f, 0.55f, 1.0f), 10.0f });
+    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(0.0f, 5.5f, 0.0f), 14.0f, XMFLOAT3(1.0f, 0.95f, 0.8f), 8.0f });
 
-    SpotLight s0;
-    s0.Position = XMFLOAT3(-1.0f, 1.8f, -1.3f);
-    s0.Direction = XMFLOAT3(0.0f, -0.97f, 0.24f);
-    s0.InnerCos = 0.95f;
-    s0.OuterCos = 0.88f;
-    s0.Radius = 14.0f;
-    s0.Intensity = 10.0f;
-    s0.Color = XMFLOAT3(1.0f, 0.95f, 0.75f);
-    mDeferredRenderer.Lighting.SpotLights.push_back(s0);
-
-    /*SpotLight s1;
-    s1.Position = XMFLOAT3(6.7f, 5.1f, -4.9f);
-    s1.Direction = XMFLOAT3(0.33f, -0.93f, -0.14f);
-    s1.InnerCos = 0.92f;
-    s1.OuterCos = 0.80f;
-    s1.Radius = 18.0f;
-    s1.Intensity = 12.0f;
-    s1.Color = XMFLOAT3(0.8f, 0.85f, 1.0f);
-    mDeferredRenderer.Lighting.SpotLights.push_back(s1);*/
+    SpotLight spotlight;
+    spotlight.Position = XMFLOAT3(0.0f, 4.5f, -2.5f);
+    spotlight.Direction = XMFLOAT3(0.0f, -0.9f, 0.35f);
+    spotlight.InnerCos = 0.94f;
+    spotlight.OuterCos = 0.84f;
+    spotlight.Radius = 16.0f;
+    spotlight.Intensity = 12.0f;
+    spotlight.Color = XMFLOAT3(1.0f, 0.95f, 0.8f);
+    mDeferredRenderer.Lighting.SpotLights.push_back(spotlight);
 }
 
 void BoxApp::BuildBoxGeometry()
 {
-    std::string inputfile = "sponza-master\\sponza.obj";
-
-    tinyobj::ObjReaderConfig reader_config;
-    reader_config.triangulate = true;
-    reader_config.mtl_search_path = "sponza-master\\";
-
-    tinyobj::ObjReader reader;
-    if (!reader.ParseFromFile(inputfile, reader_config))
-    {
-        if (!reader.Error().empty())
-            OutputDebugStringA(reader.Error().c_str());
-
-        throw std::runtime_error("Failed to load sponza.obj (tinyobj).");
-    }
-
-    const auto& attrib = reader.GetAttrib();
-    const auto& shapes = reader.GetShapes();
-    const auto& materials = reader.GetMaterials();
-
-    // In sponza.mtl texture names are stored as "textures/....tga",
-    // so the base directory must point to "sponza-master", not ".../textures".
-    std::filesystem::path texBase = std::filesystem::path("sponza-master");
-
-    auto fallback = std::make_unique<Texture>();
-    fallback->Name = "__fallback";
-    fallback->Filename = L"";
-    D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1);
-    ThrowIfFailed(md3dDevice->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE,
-        &texDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(fallback->Resource.GetAddressOf())));
-    ThrowIfFailed(md3dDevice->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD), D3D12_HEAP_FLAG_NONE,
-        &CD3DX12_RESOURCE_DESC::Buffer(1024), D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(fallback->UploadHeap.GetAddressOf())));
-    uint32_t white = 0xFFFFFFFF;
-    D3D12_SUBRESOURCE_DATA srd = { &white, 4, 4 };
-    UpdateSubresources(mCommandList.Get(), fallback->Resource.Get(), fallback->UploadHeap.Get(), 0, 0, 1, &srd);
-    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(fallback->Resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-    mTextureIndexByName[fallback->Name] = 0;
-    mTextures.push_back(std::move(fallback));
-
-    struct BatchKey
-    {
-        int MaterialId = -1;
-        size_t ShapeIndex = 0;
-
-        bool operator==(const BatchKey& rhs) const
-        {
-            return MaterialId == rhs.MaterialId && ShapeIndex == rhs.ShapeIndex;
-        }
-    };
-
-    struct BatchKeyHash
-    {
-        size_t operator()(const BatchKey& key) const
-        {
-            size_t h1 = std::hash<int>{}(key.MaterialId);
-            size_t h2 = std::hash<size_t>{}(key.ShapeIndex);
-            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-        }
-    };
-
-    struct BatchBucket
-    {
-        UINT SrvIndex = 0;
-        XMFLOAT4 Tint = XMFLOAT4(1, 1, 1, 1);
-        std::vector<Vertex> Vertices;
-        std::vector<std::uint32_t> LocalIndices;
-    };
-
-    std::unordered_map<BatchKey, BatchBucket, BatchKeyHash> buckets;
-    std::vector<BatchKey> batchOrder;
+    mTextures.clear();
+    mTextureIndexByName.clear();
     mDrawBatches.clear();
 
-    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
-    {
-        const auto& shape = shapes[shapeIndex];
-        size_t faceOffset = 0;
-
-        for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f)
-        {
-            const int fv = shape.mesh.num_face_vertices[f];
-            const int materialId = (f < shape.mesh.material_ids.size()) ? shape.mesh.material_ids[f] : -1;
-            const BatchKey key{ materialId, shapeIndex };
-
-            auto it = buckets.find(key);
-            if (it == buckets.end())
-            {
-                BatchBucket bucket;
-                if (materialId >= 0 && materialId < static_cast<int>(materials.size()))
-                {
-                    const auto& m = materials[materialId];
-                    if (!m.diffuse_texname.empty())
-                        bucket.SrvIndex = LoadOrCreateTexture(texBase, m.diffuse_texname);
-                    bucket.Tint = XMFLOAT4(m.diffuse[0], m.diffuse[1], m.diffuse[2], 1.0f);
-                }
-
-                auto inserted = buckets.emplace(key, std::move(bucket));
-                it = inserted.first;
-                batchOrder.push_back(key);
-            }
-
-            BatchBucket& bucket = it->second;
-            for (int v = 0; v < fv; ++v)
-            {
-                const auto& idx = shape.mesh.indices[faceOffset + v];
-                Vertex vert = {};
-                vert.Pos.x = attrib.vertices[3 * idx.vertex_index + 0] * 0.01f;
-                vert.Pos.y = attrib.vertices[3 * idx.vertex_index + 1] * 0.01f;
-                vert.Pos.z = attrib.vertices[3 * idx.vertex_index + 2] * 0.01f;
-                if (idx.normal_index >= 0 && !attrib.normals.empty())
-                {
-                    vert.Normal.x = attrib.normals[3 * idx.normal_index + 0];
-                    vert.Normal.y = attrib.normals[3 * idx.normal_index + 1];
-                    vert.Normal.z = attrib.normals[3 * idx.normal_index + 2];
-                }
-                else
-                {
-                    vert.Normal = XMFLOAT3(0, 1, 0);
-                }
-
-                if (idx.texcoord_index >= 0 && !attrib.texcoords.empty())
-                {
-                    vert.TexC.x = attrib.texcoords[2 * idx.texcoord_index + 0];
-                    vert.TexC.y = 1.0f - attrib.texcoords[2 * idx.texcoord_index + 1];
-                }
-                else
-                {
-                    vert.TexC = XMFLOAT2(0, 0);
-                }
-
-                bucket.Vertices.push_back(vert);
-                bucket.LocalIndices.push_back(static_cast<uint32_t>(bucket.Vertices.size() - 1));
-            }
-
-            faceOffset += fv;
-        }
-    }
+    const UINT whiteSrv = CreateSolidColorTexture("__white", { 255, 255, 255, 255 });
+    const UINT flatNormalSrv = CreateSolidColorTexture("__flatNormal", { 128, 128, 255, 255 });
+    const UINT neutralDisplacementSrv = CreateSolidColorTexture("__neutralDisplacement", { 128, 128, 128, 255 });
 
     std::vector<Vertex> vertices;
     std::vector<std::uint32_t> indices;
-    vertices.reserve(attrib.vertices.size() / 3);
-    indices.reserve(attrib.vertices.size() / 3);
 
-    for (const BatchKey& key : batchOrder)
+    auto appendBatchGeometry = [&](const std::vector<Vertex>& batchVertices, const std::vector<std::uint32_t>& batchIndices, const DrawBatch& sourceBatch)
     {
-        BatchBucket& bucket = buckets[key];
-        DrawBatch batch;
+        DrawBatch batch = sourceBatch;
         batch.StartIndexLocation = static_cast<UINT>(indices.size());
-        batch.SrvIndex = bucket.SrvIndex;
-        batch.Tint = bucket.Tint;
+        batch.IndexCount = static_cast<UINT>(batchIndices.size());
 
-        const uint32_t baseVertex = static_cast<uint32_t>(vertices.size());
-        vertices.insert(vertices.end(), bucket.Vertices.begin(), bucket.Vertices.end());
-        for (uint32_t localIndex : bucket.LocalIndices)
-            indices.push_back(baseVertex + localIndex);
+        const std::uint32_t baseVertex = static_cast<std::uint32_t>(vertices.size());
+        vertices.insert(vertices.end(), batchVertices.begin(), batchVertices.end());
+        for (std::uint32_t idx : batchIndices)
+            indices.push_back(baseVertex + idx);
 
-        batch.IndexCount = static_cast<UINT>(bucket.LocalIndices.size());
         mDrawBatches.push_back(batch);
+    };
+
+    {
+        std::string inputfile = "sponza-master\\sponza.obj";
+
+        tinyobj::ObjReaderConfig reader_config;
+        reader_config.triangulate = true;
+        reader_config.mtl_search_path = "sponza-master\\";
+
+        tinyobj::ObjReader reader;
+        if (!reader.ParseFromFile(inputfile, reader_config))
+        {
+            if (!reader.Error().empty())
+                OutputDebugStringA(reader.Error().c_str());
+
+            throw std::runtime_error("Failed to load sponza.obj (tinyobj).");
+        }
+
+        const auto& attrib = reader.GetAttrib();
+        const auto& shapes = reader.GetShapes();
+        const auto& materials = reader.GetMaterials();
+        const std::filesystem::path texBase = std::filesystem::path("sponza-master");
+
+        struct BatchKey
+        {
+            int MaterialId = -1;
+            size_t ShapeIndex = 0;
+
+            bool operator==(const BatchKey& rhs) const
+            {
+                return MaterialId == rhs.MaterialId && ShapeIndex == rhs.ShapeIndex;
+            }
+        };
+
+        struct BatchKeyHash
+        {
+            size_t operator()(const BatchKey& key) const
+            {
+                size_t h1 = std::hash<int>{}(key.MaterialId);
+                size_t h2 = std::hash<size_t>{}(key.ShapeIndex);
+                return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+            }
+        };
+
+        struct BatchBucket
+        {
+            DrawBatch Batch;
+            std::vector<Vertex> Vertices;
+            std::vector<std::uint32_t> LocalIndices;
+        };
+
+        std::unordered_map<BatchKey, BatchBucket, BatchKeyHash> buckets;
+        std::vector<BatchKey> batchOrder;
+
+        for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
+        {
+            const auto& shape = shapes[shapeIndex];
+            size_t faceOffset = 0;
+
+            for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f)
+            {
+                const int fv = shape.mesh.num_face_vertices[f];
+                const int materialId = (f < shape.mesh.material_ids.size()) ? shape.mesh.material_ids[f] : -1;
+                const BatchKey key{ materialId, shapeIndex };
+
+                auto it = buckets.find(key);
+                if (it == buckets.end())
+                {
+                    BatchBucket bucket;
+                    bucket.Batch.DiffuseSrvIndex = whiteSrv;
+                    bucket.Batch.NormalSrvIndex = flatNormalSrv;
+                    bucket.Batch.DisplacementSrvIndex = neutralDisplacementSrv;
+
+                    if (materialId >= 0 && materialId < static_cast<int>(materials.size()))
+                    {
+                        const auto& material = materials[materialId];
+                        if (!material.diffuse_texname.empty())
+                            bucket.Batch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, material.diffuse_texname);
+
+                        const std::string normalTexName = !material.normal_texname.empty() ? material.normal_texname :
+                            (!material.bump_texname.empty() ? material.bump_texname : material.displacement_texname);
+                        if (!normalTexName.empty())
+                            bucket.Batch.NormalSrvIndex = LoadOrCreateTexture(texBase, normalTexName);
+
+                        const std::string displacementTexName = !material.displacement_texname.empty() ? material.displacement_texname : normalTexName;
+                        if (!displacementTexName.empty())
+                            bucket.Batch.DisplacementSrvIndex = LoadOrCreateTexture(texBase, displacementTexName);
+
+                        bucket.Batch.Tint = XMFLOAT4(material.diffuse[0], material.diffuse[1], material.diffuse[2], 1.0f);
+                    }
+
+                    auto inserted = buckets.emplace(key, std::move(bucket));
+                    it = inserted.first;
+                    batchOrder.push_back(key);
+                }
+
+                BatchBucket& bucket = it->second;
+                for (int v = 0; v < fv; ++v)
+                {
+                    const auto& idx = shape.mesh.indices[faceOffset + v];
+                    Vertex vert = {};
+                    vert.Pos.x = attrib.vertices[3 * idx.vertex_index + 0] * 0.01f;
+                    vert.Pos.y = attrib.vertices[3 * idx.vertex_index + 1] * 0.01f;
+                    vert.Pos.z = attrib.vertices[3 * idx.vertex_index + 2] * 0.01f;
+
+                    if (idx.normal_index >= 0 && !attrib.normals.empty())
+                    {
+                        vert.Normal.x = attrib.normals[3 * idx.normal_index + 0];
+                        vert.Normal.y = attrib.normals[3 * idx.normal_index + 1];
+                        vert.Normal.z = attrib.normals[3 * idx.normal_index + 2];
+                    }
+                    else
+                    {
+                        vert.Normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
+                    }
+
+                    if (idx.texcoord_index >= 0 && !attrib.texcoords.empty())
+                    {
+                        vert.TexC.x = attrib.texcoords[2 * idx.texcoord_index + 0];
+                        vert.TexC.y = 1.0f - attrib.texcoords[2 * idx.texcoord_index + 1];
+                    }
+                    else
+                    {
+                        vert.TexC = XMFLOAT2(0.0f, 0.0f);
+                    }
+
+                    vert.Tangent = BuildFallbackTangent(vert.Normal);
+
+                    bucket.Vertices.push_back(vert);
+                    bucket.LocalIndices.push_back(static_cast<uint32_t>(bucket.Vertices.size() - 1));
+                }
+
+                faceOffset += fv;
+            }
+        }
+
+        for (const BatchKey& key : batchOrder)
+        {
+            BatchBucket& bucket = buckets[key];
+            ComputeTangents(bucket.Vertices, bucket.LocalIndices);
+            appendBatchGeometry(bucket.Vertices, bucket.LocalIndices, bucket.Batch);
+        }
     }
 
-    const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
-    const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint32_t);
+    {
+        GeometryGenerator geoGen;
+        const std::filesystem::path texBase = std::filesystem::path("sponza-master");
+
+        auto addGeneratedMesh = [&](const GeometryGenerator::MeshData& meshData, DrawBatch batch)
+        {
+            std::vector<Vertex> localVertices;
+            localVertices.reserve(meshData.Vertices.size());
+
+            for (const auto& srcVertex : meshData.Vertices)
+            {
+                Vertex v = {};
+                v.Pos = srcVertex.Position;
+                v.Normal = srcVertex.Normal;
+                v.Tangent = srcVertex.TangentU;
+                v.TexC = srcVertex.TexC;
+                localVertices.push_back(v);
+            }
+
+            ComputeTangents(localVertices, meshData.Indices32);
+            appendBatchGeometry(localVertices, meshData.Indices32, batch);
+        };
+
+        DrawBatch plinthBatch;
+        plinthBatch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, "textures/spnza_bricks_a_diff.tga");
+        plinthBatch.NormalSrvIndex = LoadOrCreateTexture(texBase, "textures/spnza_bricks_a_ddn.tga");
+        plinthBatch.DisplacementSrvIndex = LoadOrCreateTexture(texBase, "textures/spnza_bricks_a_ddn.tga");
+        plinthBatch.Tessellated = true;
+        plinthBatch.UvScale = XMFLOAT2(2.0f, 2.0f);
+        plinthBatch.DisplacementScale = 0.08f;
+        XMStoreFloat4x4(&plinthBatch.World, XMMatrixRotationY(0.35f) * XMMatrixTranslation(-1.8f, 0.8f, -1.3f));
+        addGeneratedMesh(geoGen.CreateBox(1.5f, 1.6f, 1.5f, 0), plinthBatch);
+
+        DrawBatch columnBatch;
+        columnBatch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, "textures/vase_dif.tga");
+        columnBatch.NormalSrvIndex = LoadOrCreateTexture(texBase, "textures/vase_ddn.tga");
+        columnBatch.DisplacementSrvIndex = LoadOrCreateTexture(texBase, "textures/vase_ddn.tga");
+        columnBatch.Tessellated = true;
+        columnBatch.UvScale = XMFLOAT2(1.0f, 1.6f);
+        columnBatch.DisplacementScale = 0.06f;
+        XMStoreFloat4x4(&columnBatch.World, XMMatrixRotationY(-0.45f) * XMMatrixTranslation(1.8f, 1.2f, -0.5f));
+        addGeneratedMesh(geoGen.CreateCylinder(0.55f, 0.85f, 2.4f, 24, 6), columnBatch);
+    }
+
+    const UINT vbByteSize = static_cast<UINT>(vertices.size() * sizeof(Vertex));
+    const UINT ibByteSize = static_cast<UINT>(indices.size() * sizeof(std::uint32_t));
 
     mBoxGeo = std::make_unique<MeshGeometry>();
-    mBoxGeo->Name = "sponzaGeo";
+    mBoxGeo->Name = "sceneGeo";
 
     ThrowIfFailed(D3DCreateBlob(vbByteSize, &mBoxGeo->VertexBufferCPU));
     CopyMemory(mBoxGeo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
@@ -883,7 +1134,6 @@ void BoxApp::BuildBoxGeometry()
 
     mBoxGeo->VertexByteStride = sizeof(Vertex);
     mBoxGeo->VertexBufferByteSize = vbByteSize;
-
     mBoxGeo->IndexFormat = DXGI_FORMAT_R32_UINT;
     mBoxGeo->IndexBufferByteSize = ibByteSize;
 }
@@ -891,7 +1141,7 @@ void BoxApp::BuildBoxGeometry()
 void BoxApp::BuildPSOs()
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC gbufferPsoDesc = {};
-    gbufferPsoDesc.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
+    gbufferPsoDesc.InputLayout = { mInputLayout.data(), static_cast<UINT>(mInputLayout.size()) };
     gbufferPsoDesc.pRootSignature = mGeometryRootSignature.Get();
     gbufferPsoDesc.VS =
     {
@@ -915,6 +1165,25 @@ void BoxApp::BuildPSOs()
     gbufferPsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
     gbufferPsoDesc.DSVFormat = mDepthStencilFormat;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&gbufferPsoDesc, IID_PPV_ARGS(&mGBufferPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gbufferTessPsoDesc = gbufferPsoDesc;
+    gbufferTessPsoDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(mGBufferTessVS->GetBufferPointer()),
+        mGBufferTessVS->GetBufferSize()
+    };
+    gbufferTessPsoDesc.HS =
+    {
+        reinterpret_cast<BYTE*>(mGBufferHS->GetBufferPointer()),
+        mGBufferHS->GetBufferSize()
+    };
+    gbufferTessPsoDesc.DS =
+    {
+        reinterpret_cast<BYTE*>(mGBufferDS->GetBufferPointer()),
+        mGBufferDS->GetBufferSize()
+    };
+    gbufferTessPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&gbufferTessPsoDesc, IID_PPV_ARGS(&mGBufferTessPSO)));
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC lightPsoDesc = {};
     lightPsoDesc.InputLayout = { nullptr, 0 };
