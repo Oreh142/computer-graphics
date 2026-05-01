@@ -240,6 +240,7 @@ private:
         UINT NormalSrvIndex = 0;
         UINT DisplacementSrvIndex = 0;
         bool Tessellated = false;
+        bool AnimateUv = false;
         XMFLOAT2 UvScale = XMFLOAT2(1.0f, 1.0f);
         float DisplacementScale = 0.0f;
         float Padding = 0.0f;
@@ -268,12 +269,14 @@ private:
     ComPtr<ID3DBlob> mGBufferDS = nullptr;
     ComPtr<ID3DBlob> mLightingVS = nullptr;
     ComPtr<ID3DBlob> mLightingPS = nullptr;
+    ComPtr<ID3DBlob> mDebugWirePS = nullptr;
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
 
     ComPtr<ID3D12PipelineState> mGBufferPSO = nullptr;
     ComPtr<ID3D12PipelineState> mGBufferTessPSO = nullptr;
     ComPtr<ID3D12PipelineState> mLightingPSO = nullptr;
+    ComPtr<ID3D12PipelineState> mTessWirePSO = nullptr;
 
     FreeCamera mCamera;
     float mMoveSpeed = 10.0f;
@@ -283,8 +286,8 @@ private:
     bool mDebugViewKeyWasDown = false;
     bool mTextureAnimationEnabled = true;
     bool mTextureAnimationKeyWasDown = false;
-    float mUvAnimSpeedU = 0.1f;
-    float mUvAnimSpeedV = 0.05f;
+    float mUvAnimSpeedU = 0.035f;
+    float mUvAnimSpeedV = 0.018f;
     XMFLOAT2 mAnimatedUvOffset = XMFLOAT2(0.0f, 0.0f);
     float mTessMinDistance = 3.0f;
     float mTessMaxDistance = 20.0f;
@@ -367,18 +370,20 @@ void BoxApp::OnResize()
 std::wstring BoxApp::GetAdditionalWindowText() const
 {
     const XMFLOAT3 cameraPos = mCamera.GetPosition3f();
-    static const std::array<const wchar_t*, 4> kDebugViewNames =
+    static const std::array<const wchar_t*, 5> kDebugViewNames =
     {
         L"Lit",
         L"Albedo",
         L"Normal",
-        L"Depth"
+        L"Depth",
+        L"Tess Wire"
     };
 
     std::wostringstream stream;
     stream << std::fixed << std::setprecision(2)
            << L"cam xyz: (" << cameraPos.x << L", " << cameraPos.y << L", " << cameraPos.z << L")"
            << L" | debug: " << kDebugViewNames[mDebugView]
+           << L" | tex anim: " << (mTextureAnimationEnabled ? L"on" : L"off")
            << L" | tess range: [" << mTessMinDistance << L", " << mTessMaxDistance << L"]";
 
     return stream.str();
@@ -400,7 +405,7 @@ void BoxApp::Update(const GameTimer& gt)
 
     const bool debugKeyDown = d3dUtil::IsKeyDown('G');
     if (debugKeyDown && !mDebugViewKeyWasDown)
-        mDebugView = (mDebugView + 1) % 4;
+        mDebugView = (mDebugView + 1) % 5;
     mDebugViewKeyWasDown = debugKeyDown;
 
     const bool textureAnimationKeyDown = d3dUtil::IsKeyDown('T');
@@ -553,9 +558,46 @@ void BoxApp::Draw(const GameTimer& gt)
     mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     mCommandList->DrawInstanced(3, 1, 0, 0);
 
+    D3D12_RESOURCE_STATES depthStateBeforePresent = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (mDebugView == 4)
+    {
+        CD3DX12_RESOURCE_BARRIER debugDepthBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_READ);
+        mCommandList->ResourceBarrier(1, &debugDepthBarrier);
+        depthStateBeforePresent = D3D12_RESOURCE_STATE_DEPTH_READ;
+
+        mCommandList->SetGraphicsRootSignature(mGeometryRootSignature.Get());
+        mCommandList->SetDescriptorHeaps(_countof(geomHeaps), geomHeaps);
+        mCommandList->SetPipelineState(mTessWirePSO.Get());
+        mCommandList->OMSetRenderTargets(1, &backBufferRtv, false, &DepthStencilView());
+        mCommandList->IASetVertexBuffers(0, 1, &mBoxGeo->VertexBufferView());
+        mCommandList->IASetIndexBuffer(&mBoxGeo->IndexBufferView());
+        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+
+        for (size_t i = 0; i < mDrawBatches.size(); ++i)
+        {
+            const DrawBatch& batch = mDrawBatches[i];
+            if (!batch.Tessellated)
+                continue;
+
+            auto diffuseHandle = baseSrvHandle;
+            diffuseHandle.ptr += static_cast<SIZE_T>(batch.DiffuseSrvIndex) * descSize;
+            auto normalHandle = baseSrvHandle;
+            normalHandle.ptr += static_cast<SIZE_T>(batch.NormalSrvIndex) * descSize;
+            auto displacementHandle = baseSrvHandle;
+            displacementHandle.ptr += static_cast<SIZE_T>(batch.DisplacementSrvIndex) * descSize;
+
+            mCommandList->SetGraphicsRootConstantBufferView(0, objectCbAddress + static_cast<UINT64>(i) * objCBByteSize);
+            mCommandList->SetGraphicsRootDescriptorTable(1, diffuseHandle);
+            mCommandList->SetGraphicsRootDescriptorTable(2, normalHandle);
+            mCommandList->SetGraphicsRootDescriptorTable(3, displacementHandle);
+            mCommandList->DrawIndexedInstanced(batch.IndexCount, 1, batch.StartIndexLocation, 0, 0);
+        }
+    }
+
     CD3DX12_RESOURCE_BARRIER endFrame[2] =
     {
-        CD3DX12_RESOURCE_BARRIER::Transition(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        CD3DX12_RESOURCE_BARRIER::Transition(depth, depthStateBeforePresent, D3D12_RESOURCE_STATE_DEPTH_WRITE),
         CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)
     };
     mCommandList->ResourceBarrier(2, endFrame);
@@ -864,6 +906,7 @@ void BoxApp::BuildShadersAndInputLayout()
     mGBufferDS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferDS", "ds_5_0");
     mLightingVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "LightingVS", "vs_5_0");
     mLightingPS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "LightingPS", "ps_5_0");
+    mDebugWirePS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "DebugTessWirePS", "ps_5_0");
 
     mInputLayout =
     {
@@ -1069,6 +1112,7 @@ void BoxApp::BuildBoxGeometry()
     {
         GeometryGenerator geoGen;
         const std::filesystem::path texBase = std::filesystem::path("sponza-master");
+        const std::filesystem::path texturesBase = std::filesystem::path("..") / ".." / "Textures";
 
         auto addGeneratedMesh = [&](const GeometryGenerator::MeshData& meshData, DrawBatch batch)
         {
@@ -1108,6 +1152,18 @@ void BoxApp::BuildBoxGeometry()
         columnBatch.DisplacementScale = 0.06f;
         XMStoreFloat4x4(&columnBatch.World, XMMatrixRotationY(-0.45f) * XMMatrixTranslation(1.8f, 1.2f, -0.5f));
         addGeneratedMesh(geoGen.CreateCylinder(0.55f, 0.85f, 2.4f, 24, 6), columnBatch);
+
+        DrawBatch waterBatch;
+        waterBatch.DiffuseSrvIndex = LoadOrCreateTexture(texturesBase, "water1.dds");
+        waterBatch.NormalSrvIndex = LoadOrCreateTexture(texturesBase, "default_nmap.dds");
+        waterBatch.DisplacementSrvIndex = LoadOrCreateTexture(texturesBase, "water1.dds");
+        waterBatch.Tessellated = true;
+        waterBatch.AnimateUv = true;
+        waterBatch.UvScale = XMFLOAT2(3.0f, 3.0f);
+        waterBatch.DisplacementScale = 0.08f;
+        waterBatch.Tint = XMFLOAT4(0.72f, 0.86f, 0.98f, 1.0f);
+        XMStoreFloat4x4(&waterBatch.World, XMMatrixTranslation(-6.65f, 0.06f, -0.45f));
+        addGeneratedMesh(geoGen.CreateGrid(6.0f, 4.0f, 8, 8), waterBatch);
     }
 
     const UINT vbByteSize = static_cast<UINT>(vertices.size() * sizeof(Vertex));
@@ -1184,6 +1240,21 @@ void BoxApp::BuildPSOs()
     };
     gbufferTessPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&gbufferTessPsoDesc, IID_PPV_ARGS(&mGBufferTessPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC tessWirePsoDesc = gbufferTessPsoDesc;
+    tessWirePsoDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(mDebugWirePS->GetBufferPointer()),
+        mDebugWirePS->GetBufferSize()
+    };
+    tessWirePsoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    tessWirePsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    tessWirePsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    tessWirePsoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    tessWirePsoDesc.NumRenderTargets = 1;
+    tessWirePsoDesc.RTVFormats[0] = mBackBufferFormat;
+    tessWirePsoDesc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&tessWirePsoDesc, IID_PPV_ARGS(&mTessWirePSO)));
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC lightPsoDesc = {};
     lightPsoDesc.InputLayout = { nullptr, 0 };

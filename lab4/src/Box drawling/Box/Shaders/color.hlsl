@@ -70,8 +70,15 @@ float3 SampleNormalTS(float2 uv)
 
 float SampleDisplacement(float2 uv)
 {
-    float3 disp = gDisplacementMap.SampleLevel(gsamLinearWrap, uv, 0).rgb;
+    float maxUvScale = max(max(gUvScale.x, gUvScale.y), 1.0f);
+    float mipLevel = max(log2(maxUvScale) - 0.75f, 0.0f);
+    float3 disp = gDisplacementMap.SampleLevel(gsamLinearWrap, uv, mipLevel).rgb;
     return dot(disp, float3(0.299f, 0.587f, 0.114f));
+}
+
+float SampleDisplacementHeight(float2 uv)
+{
+    return (SampleDisplacement(uv) - 0.5f) * gDisplacementScale;
 }
 
 float3 TangentToWorld(float3 normalTS, float3 normalW, float3 tangentW)
@@ -79,6 +86,27 @@ float3 TangentToWorld(float3 normalTS, float3 normalW, float3 tangentW)
     tangentW = normalize(tangentW - normalW * dot(tangentW, normalW));
     float3 bitangentW = normalize(cross(normalW, tangentW));
     return normalize(normalTS.x * tangentW + normalTS.y * bitangentW + normalTS.z * normalW);
+}
+
+float3 ComputeDisplacedNormalL(float2 uv, float3 normalL, float3 tangentL)
+{
+    uint width = 1;
+    uint height = 1;
+    gDisplacementMap.GetDimensions(width, height);
+
+    float2 texelSize = 1.0f / max(float2(width, height), float2(1.0f, 1.0f));
+
+    tangentL = normalize(tangentL - normalL * dot(tangentL, normalL));
+    float3 bitangentL = normalize(cross(normalL, tangentL));
+
+    float hLeft = SampleDisplacementHeight(uv - float2(texelSize.x, 0.0f));
+    float hRight = SampleDisplacementHeight(uv + float2(texelSize.x, 0.0f));
+    float hDown = SampleDisplacementHeight(uv - float2(0.0f, texelSize.y));
+    float hUp = SampleDisplacementHeight(uv + float2(0.0f, texelSize.y));
+
+    float2 slope = float2(hLeft - hRight, hDown - hUp) * 8.0f;
+    float3 normalTS = normalize(float3(slope.x, slope.y, 1.0f));
+    return normalize(normalTS.x * tangentL + normalTS.y * bitangentL + normalTS.z * normalL);
 }
 
 SurfaceOut BuildSurface(float3 posL, float3 normalL, float3 tangentL, float2 texC)
@@ -180,8 +208,9 @@ SurfaceOut GBufferDS(PatchTess patchTess, float3 bary : SV_DomainLocation, const
     float2 texC = patch[0].TexC * bary.x + patch[1].TexC * bary.y + patch[2].TexC * bary.z;
 
     float2 uv = texC * gUvScale + gUvOffset;
-    float height = SampleDisplacement(uv);
-    posL += normalL * ((height - 0.5f) * gDisplacementScale);
+    float height = SampleDisplacementHeight(uv);
+    posL += normalL * height;
+    normalL = ComputeDisplacedNormalL(uv, normalL, tangentL);
 
     SurfaceOut outv;
     float4 posW = mul(float4(posL, 1.0f), gWorld);
@@ -348,4 +377,9 @@ float4 LightingPS(FSOut pin) : SV_Target
     }
 
     return float4(result, albedo.a);
+}
+
+float4 DebugTessWirePS(SurfaceOut pin) : SV_Target
+{
+    return float4(0.08f, 0.98f, 1.0f, 1.0f);
 }
