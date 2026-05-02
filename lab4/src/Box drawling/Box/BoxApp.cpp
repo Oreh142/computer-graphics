@@ -23,9 +23,18 @@
 #include <iomanip>
 #include <array>
 #include <cmath>
+#include <limits>
+#include <random>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
+
+namespace
+{
+    constexpr UINT kSceneSponza = 0;
+    constexpr UINT kSceneForest = 1;
+    constexpr UINT kInvalidIndex = (std::numeric_limits<UINT>::max)();
+}
 
 struct Vertex
 {
@@ -114,6 +123,53 @@ static TgaImage LoadTgaRgba(const std::wstring& filePath)
 
 namespace
 {
+    BoundingBox MakeBoundingBox(const XMFLOAT3& minPoint, const XMFLOAT3& maxPoint)
+    {
+        const XMFLOAT3 center(
+            0.5f * (minPoint.x + maxPoint.x),
+            0.5f * (minPoint.y + maxPoint.y),
+            0.5f * (minPoint.z + maxPoint.z));
+
+        const XMFLOAT3 extents(
+            0.5f * (maxPoint.x - minPoint.x),
+            0.5f * (maxPoint.y - minPoint.y),
+            0.5f * (maxPoint.z - minPoint.z));
+
+        return BoundingBox(center, extents);
+    }
+
+    BoundingBox ComputeLocalBounds(const std::vector<Vertex>& vertices)
+    {
+        XMFLOAT3 minPoint(
+            (std::numeric_limits<float>::max)(),
+            (std::numeric_limits<float>::max)(),
+            (std::numeric_limits<float>::max)());
+        XMFLOAT3 maxPoint(
+            -(std::numeric_limits<float>::max)(),
+            -(std::numeric_limits<float>::max)(),
+            -(std::numeric_limits<float>::max)());
+
+        for (const Vertex& vertex : vertices)
+        {
+            minPoint.x = (std::min)(minPoint.x, vertex.Pos.x);
+            minPoint.y = (std::min)(minPoint.y, vertex.Pos.y);
+            minPoint.z = (std::min)(minPoint.z, vertex.Pos.z);
+
+            maxPoint.x = (std::max)(maxPoint.x, vertex.Pos.x);
+            maxPoint.y = (std::max)(maxPoint.y, vertex.Pos.y);
+            maxPoint.z = (std::max)(maxPoint.z, vertex.Pos.z);
+        }
+
+        return MakeBoundingBox(minPoint, maxPoint);
+    }
+
+    BoundingBox TransformBounds(const BoundingBox& bounds, const XMFLOAT4X4& world)
+    {
+        BoundingBox transformed;
+        bounds.Transform(transformed, XMLoadFloat4x4(&world));
+        return transformed;
+    }
+
     XMFLOAT3 BuildFallbackTangent(const XMFLOAT3& normal)
     {
         XMVECTOR n = XMVector3Normalize(XMLoadFloat3(&normal));
@@ -219,6 +275,14 @@ private:
     virtual void OnMouseUp(WPARAM btnState, int x, int y)override;
     virtual void OnMouseMove(WPARAM btnState, int x, int y)override;
 
+    struct OctreeNode;
+
+    void SetActiveScene(UINT sceneId);
+    void UpdateVisibleBatches();
+    void BuildForestOctree();
+    void InsertIntoOctree(OctreeNode& node, UINT objectIndex, int depth);
+    void QueryOctree(const OctreeNode& node, const BoundingFrustum& frustum, std::vector<UINT>& visibleBatches, UINT& visibleObjects) const;
+    void CollectOctreeBatches(const OctreeNode& node, std::vector<UINT>& visibleBatches, UINT& visibleObjects) const;
     void BuildDescriptorHeaps();
     void BuildDeferredSrvHeap();
     void UpdateDeferredSrvDescriptors();
@@ -228,6 +292,7 @@ private:
     void BuildBoxGeometry();
     void BuildPSOs();
     void BuildLights();
+    UINT CreateRgbaTexture(const std::string& name, UINT width, UINT height, const std::vector<std::uint8_t>& rgba);
     UINT CreateSolidColorTexture(const std::string& name, const std::array<std::uint8_t, 4>& rgba);
     UINT LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName);
 
@@ -239,13 +304,31 @@ private:
         UINT DiffuseSrvIndex = 0;
         UINT NormalSrvIndex = 0;
         UINT DisplacementSrvIndex = 0;
+        UINT SceneId = kSceneSponza;
+        UINT CullObjectIndex = kInvalidIndex;
         bool Tessellated = false;
         bool AnimateUv = false;
+        bool Cullable = false;
         XMFLOAT2 UvScale = XMFLOAT2(1.0f, 1.0f);
         float DisplacementScale = 0.0f;
         float Padding = 0.0f;
         XMFLOAT4 Tint = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
         XMFLOAT4X4 World = MathHelper::Identity4x4();
+        BoundingBox Bounds;
+    };
+
+    struct CullObject
+    {
+        BoundingBox Bounds;
+        UINT BatchIndex = 0;
+    };
+
+    struct OctreeNode
+    {
+        BoundingBox Bounds;
+        BoundingBox LooseBounds;
+        std::vector<UINT> ObjectIndices;
+        std::array<std::unique_ptr<OctreeNode>, 8> Children;
     };
 
     ComPtr<ID3D12RootSignature> mGeometryRootSignature = nullptr;
@@ -259,6 +342,9 @@ private:
 
     std::unique_ptr<MeshGeometry> mBoxGeo = nullptr;
     std::vector<DrawBatch> mDrawBatches;
+    std::vector<UINT> mVisibleBatchIndices;
+    std::vector<CullObject> mForestObjects;
+    std::unique_ptr<OctreeNode> mForestOctreeRoot = nullptr;
     std::vector<std::unique_ptr<Texture>> mTextures;
     std::unordered_map<std::string, UINT> mTextureIndexByName;
 
@@ -293,6 +379,14 @@ private:
     float mTessMaxDistance = 20.0f;
     float mTessMinFactor = 1.0f;
     float mTessMaxFactor = 12.0f;
+    UINT mActiveScene = kSceneSponza;
+    UINT mVisibleCullObjectCount = 0;
+    bool mScene1KeyWasDown = false;
+    bool mScene2KeyWasDown = false;
+    bool mFrustumCullingEnabled = true;
+    bool mFrustumCullingKeyWasDown = false;
+    bool mOctreeCullingEnabled = true;
+    bool mOctreeCullingKeyWasDown = false;
 
     POINT mLastMousePos;
 };
@@ -346,6 +440,8 @@ bool BoxApp::Initialize()
     mDeferredRenderer.Buffers.Build(md3dDevice.Get(), mClientWidth, mClientHeight);
     UpdateDeferredSrvDescriptors();
     BuildLights();
+    mCamera.UpdateViewMatrix();
+    UpdateVisibleBatches();
 
     ThrowIfFailed(mCommandList->Close());
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
@@ -367,6 +463,79 @@ void BoxApp::OnResize()
     }
 }
 
+void BoxApp::SetActiveScene(UINT sceneId)
+{
+    if (mActiveScene == sceneId)
+        return;
+
+    mActiveScene = sceneId;
+
+    if (mActiveScene == kSceneForest)
+    {
+        mMoveSpeed = 32.0f;
+        mCamera.SetPosition(0.0f, 5.0f, -72.0f);
+    }
+    else
+    {
+        mMoveSpeed = 10.0f;
+        mCamera.SetPosition(0.0f, 2.2f, -8.5f);
+    }
+}
+
+void BoxApp::UpdateVisibleBatches()
+{
+    mVisibleBatchIndices.clear();
+    mVisibleCullObjectCount = 0;
+
+    auto addSceneNonCullableBatches = [&]()
+    {
+        for (UINT i = 0; i < static_cast<UINT>(mDrawBatches.size()); ++i)
+        {
+            const DrawBatch& batch = mDrawBatches[i];
+            if (batch.SceneId == mActiveScene && !batch.Cullable)
+                mVisibleBatchIndices.push_back(i);
+        }
+    };
+
+    addSceneNonCullableBatches();
+
+    if (mActiveScene != kSceneForest)
+        return;
+
+    if (!mFrustumCullingEnabled)
+    {
+        for (const CullObject& object : mForestObjects)
+            mVisibleBatchIndices.push_back(object.BatchIndex);
+
+        mVisibleCullObjectCount = static_cast<UINT>(mForestObjects.size());
+        return;
+    }
+
+    BoundingFrustum viewSpaceFrustum;
+    BoundingFrustum::CreateFromMatrix(viewSpaceFrustum, mCamera.GetProj());
+
+    BoundingFrustum worldSpaceFrustum;
+    const XMMATRIX invView = XMMatrixInverse(nullptr, mCamera.GetView());
+    viewSpaceFrustum.Transform(worldSpaceFrustum, invView);
+
+    if (mOctreeCullingEnabled && mForestOctreeRoot)
+    {
+        QueryOctree(*mForestOctreeRoot, worldSpaceFrustum, mVisibleBatchIndices, mVisibleCullObjectCount);
+    }
+    else
+    {
+        for (UINT objectIndex = 0; objectIndex < static_cast<UINT>(mForestObjects.size()); ++objectIndex)
+        {
+            const CullObject& object = mForestObjects[objectIndex];
+            if (worldSpaceFrustum.Contains(object.Bounds) != DISJOINT)
+            {
+                mVisibleBatchIndices.push_back(object.BatchIndex);
+                ++mVisibleCullObjectCount;
+            }
+        }
+    }
+}
+
 std::wstring BoxApp::GetAdditionalWindowText() const
 {
     const XMFLOAT3 cameraPos = mCamera.GetPosition3f();
@@ -378,13 +547,24 @@ std::wstring BoxApp::GetAdditionalWindowText() const
         L"Depth",
         L"Tess Wire"
     };
+    static const std::array<const wchar_t*, 2> kSceneNames =
+    {
+        L"Sponza",
+        L"Forest"
+    };
+
+    const wchar_t* cullingMode = L"off";
+    if (mFrustumCullingEnabled)
+        cullingMode = mOctreeCullingEnabled ? L"frustum+octree" : L"frustum";
 
     std::wostringstream stream;
     stream << std::fixed << std::setprecision(2)
-           << L"cam xyz: (" << cameraPos.x << L", " << cameraPos.y << L", " << cameraPos.z << L")"
-           << L" | debug: " << kDebugViewNames[mDebugView]
-           << L" | tex anim: " << (mTextureAnimationEnabled ? L"on" : L"off")
-           << L" | tess range: [" << mTessMinDistance << L", " << mTessMaxDistance << L"]";
+        << L"cam xyz: (" << cameraPos.x << L", " << cameraPos.y << L", " << cameraPos.z << L")"
+        << L" | scene: " << kSceneNames[mActiveScene]
+        << L" | debug: " << kDebugViewNames[mDebugView]
+        << L" | tex anim: " << (mTextureAnimationEnabled ? L"on" : L"off")
+        << L" | culling: " << cullingMode
+        << L" | visible: " << mVisibleCullObjectCount << L"/" << mForestObjects.size();
 
     return stream.str();
 }
@@ -402,6 +582,20 @@ void BoxApp::Update(const GameTimer& gt)
         mCamera.Strafe(-moveStep);
     if (d3dUtil::IsKeyDown('D'))
         mCamera.Strafe(moveStep);
+    if (d3dUtil::IsKeyDown('Q'))
+        mCamera.Rise(-moveStep);
+    if (d3dUtil::IsKeyDown('E'))
+        mCamera.Rise(moveStep);
+
+    const bool scene1KeyDown = d3dUtil::IsKeyDown('1');
+    if (scene1KeyDown && !mScene1KeyWasDown)
+        SetActiveScene(kSceneSponza);
+    mScene1KeyWasDown = scene1KeyDown;
+
+    const bool scene2KeyDown = d3dUtil::IsKeyDown('2');
+    if (scene2KeyDown && !mScene2KeyWasDown)
+        SetActiveScene(kSceneForest);
+    mScene2KeyWasDown = scene2KeyDown;
 
     const bool debugKeyDown = d3dUtil::IsKeyDown('G');
     if (debugKeyDown && !mDebugViewKeyWasDown)
@@ -413,6 +607,16 @@ void BoxApp::Update(const GameTimer& gt)
         mTextureAnimationEnabled = !mTextureAnimationEnabled;
     mTextureAnimationKeyWasDown = textureAnimationKeyDown;
 
+    const bool frustumCullingKeyDown = d3dUtil::IsKeyDown('F');
+    if (frustumCullingKeyDown && !mFrustumCullingKeyWasDown)
+        mFrustumCullingEnabled = !mFrustumCullingEnabled;
+    mFrustumCullingKeyWasDown = frustumCullingKeyDown;
+
+    const bool octreeCullingKeyDown = d3dUtil::IsKeyDown('O');
+    if (octreeCullingKeyDown && !mOctreeCullingKeyWasDown)
+        mOctreeCullingEnabled = !mOctreeCullingEnabled;
+    mOctreeCullingKeyWasDown = octreeCullingKeyDown;
+
     if (mTextureAnimationEnabled)
     {
         mAnimatedUvOffset.x += dt * mUvAnimSpeedU;
@@ -420,6 +624,7 @@ void BoxApp::Update(const GameTimer& gt)
     }
 
     mCamera.UpdateViewMatrix();
+    UpdateVisibleBatches();
 
     const XMMATRIX view = mCamera.GetView();
     const XMMATRIX proj = mCamera.GetProj();
@@ -456,6 +661,7 @@ void BoxApp::Update(const GameTimer& gt)
     pass.DirectionalLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.DirectionalLights.size(), 8));
     pass.SpotLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.SpotLights.size(), 8));
     pass.DebugView = mDebugView;
+    pass.Ambient = (mActiveScene == kSceneForest) ? 0.12f : 0.001f;
 
     for (UINT i = 0; i < pass.PointLightCount; ++i)
         pass.PointLights[i] = mDeferredRenderer.Lighting.PointLights[i];
@@ -510,9 +716,9 @@ void BoxApp::Draw(const GameTimer& gt)
         mCommandList->SetPipelineState(pso);
         mCommandList->IASetPrimitiveTopology(topology);
 
-        for (size_t i = 0; i < mDrawBatches.size(); ++i)
+        for (UINT batchIndex : mVisibleBatchIndices)
         {
-            const DrawBatch& batch = mDrawBatches[i];
+            const DrawBatch& batch = mDrawBatches[batchIndex];
             if (batch.Tessellated != tessellated)
                 continue;
 
@@ -523,7 +729,7 @@ void BoxApp::Draw(const GameTimer& gt)
             auto displacementHandle = baseSrvHandle;
             displacementHandle.ptr += static_cast<SIZE_T>(batch.DisplacementSrvIndex) * descSize;
 
-            mCommandList->SetGraphicsRootConstantBufferView(0, objectCbAddress + static_cast<UINT64>(i) * objCBByteSize);
+            mCommandList->SetGraphicsRootConstantBufferView(0, objectCbAddress + static_cast<UINT64>(batchIndex) * objCBByteSize);
             mCommandList->SetGraphicsRootDescriptorTable(1, diffuseHandle);
             mCommandList->SetGraphicsRootDescriptorTable(2, normalHandle);
             mCommandList->SetGraphicsRootDescriptorTable(3, displacementHandle);
@@ -574,9 +780,9 @@ void BoxApp::Draw(const GameTimer& gt)
         mCommandList->IASetIndexBuffer(&mBoxGeo->IndexBufferView());
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
 
-        for (size_t i = 0; i < mDrawBatches.size(); ++i)
+        for (UINT batchIndex : mVisibleBatchIndices)
         {
-            const DrawBatch& batch = mDrawBatches[i];
+            const DrawBatch& batch = mDrawBatches[batchIndex];
             if (!batch.Tessellated)
                 continue;
 
@@ -587,7 +793,7 @@ void BoxApp::Draw(const GameTimer& gt)
             auto displacementHandle = baseSrvHandle;
             displacementHandle.ptr += static_cast<SIZE_T>(batch.DisplacementSrvIndex) * descSize;
 
-            mCommandList->SetGraphicsRootConstantBufferView(0, objectCbAddress + static_cast<UINT64>(i) * objCBByteSize);
+            mCommandList->SetGraphicsRootConstantBufferView(0, objectCbAddress + static_cast<UINT64>(batchIndex) * objCBByteSize);
             mCommandList->SetGraphicsRootDescriptorTable(1, diffuseHandle);
             mCommandList->SetGraphicsRootDescriptorTable(2, normalHandle);
             mCommandList->SetGraphicsRootDescriptorTable(3, displacementHandle);
@@ -640,16 +846,19 @@ void BoxApp::OnMouseMove(WPARAM btnState, int x, int y)
     mLastMousePos.y = y;
 }
 
-UINT BoxApp::CreateSolidColorTexture(const std::string& name, const std::array<std::uint8_t, 4>& rgba)
+UINT BoxApp::CreateRgbaTexture(const std::string& name, UINT width, UINT height, const std::vector<std::uint8_t>& rgba)
 {
     auto existing = mTextureIndexByName.find(name);
     if (existing != mTextureIndexByName.end())
         return existing->second;
 
+    if (rgba.size() != static_cast<size_t>(width) * height * 4)
+        throw std::runtime_error("RGBA texture data size does not match texture dimensions");
+
     auto tex = std::make_unique<Texture>();
     tex->Name = name;
 
-    D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1);
+    D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, width, height);
     ThrowIfFailed(md3dDevice->CreateCommittedResource(
         &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
         D3D12_HEAP_FLAG_NONE,
@@ -658,10 +867,11 @@ UINT BoxApp::CreateSolidColorTexture(const std::string& name, const std::array<s
         nullptr,
         IID_PPV_ARGS(tex->Resource.GetAddressOf())));
 
+    const UINT64 uploadBufferSize = GetRequiredIntermediateSize(tex->Resource.Get(), 0, 1);
     ThrowIfFailed(md3dDevice->CreateCommittedResource(
         &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
         D3D12_HEAP_FLAG_NONE,
-        &CD3DX12_RESOURCE_DESC::Buffer(1024),
+        &CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize),
         D3D12_RESOURCE_STATE_GENERIC_READ,
         nullptr,
         IID_PPV_ARGS(tex->UploadHeap.GetAddressOf())));
@@ -669,8 +879,8 @@ UINT BoxApp::CreateSolidColorTexture(const std::string& name, const std::array<s
     const D3D12_RESOURCE_STATES shaderState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     D3D12_SUBRESOURCE_DATA subresourceData = {};
     subresourceData.pData = rgba.data();
-    subresourceData.RowPitch = 4;
-    subresourceData.SlicePitch = 4;
+    subresourceData.RowPitch = static_cast<LONG_PTR>(width * 4);
+    subresourceData.SlicePitch = subresourceData.RowPitch * height;
     UpdateSubresources(mCommandList.Get(), tex->Resource.Get(), tex->UploadHeap.Get(), 0, 0, 1, &subresourceData);
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
         tex->Resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, shaderState));
@@ -679,6 +889,11 @@ UINT BoxApp::CreateSolidColorTexture(const std::string& name, const std::array<s
     mTextureIndexByName[name] = newIndex;
     mTextures.push_back(std::move(tex));
     return newIndex;
+}
+
+UINT BoxApp::CreateSolidColorTexture(const std::string& name, const std::array<std::uint8_t, 4>& rgba)
+{
+    return CreateRgbaTexture(name, 1, 1, std::vector<std::uint8_t>(rgba.begin(), rgba.end()));
 }
 
 UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName)
@@ -766,6 +981,156 @@ UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std
     mTextureIndexByName[cacheKey] = newIndex;
     mTextures.push_back(std::move(tex));
     return newIndex;
+}
+
+void BoxApp::BuildForestOctree()
+{
+    mForestOctreeRoot.reset();
+    if (mForestObjects.empty())
+        return;
+
+    XMFLOAT3 minPoint(
+        (std::numeric_limits<float>::max)(),
+        (std::numeric_limits<float>::max)(),
+        (std::numeric_limits<float>::max)());
+    XMFLOAT3 maxPoint(
+        -(std::numeric_limits<float>::max)(),
+        -(std::numeric_limits<float>::max)(),
+        -(std::numeric_limits<float>::max)());
+
+    for (const CullObject& object : mForestObjects)
+    {
+        const XMFLOAT3& c = object.Bounds.Center;
+        const XMFLOAT3& e = object.Bounds.Extents;
+
+        minPoint.x = (std::min)(minPoint.x, c.x - e.x);
+        minPoint.y = (std::min)(minPoint.y, c.y - e.y);
+        minPoint.z = (std::min)(minPoint.z, c.z - e.z);
+
+        maxPoint.x = (std::max)(maxPoint.x, c.x + e.x);
+        maxPoint.y = (std::max)(maxPoint.y, c.y + e.y);
+        maxPoint.z = (std::max)(maxPoint.z, c.z + e.z);
+    }
+
+    const float padding = 2.0f;
+    minPoint.x -= padding;
+    minPoint.y -= padding;
+    minPoint.z -= padding;
+    maxPoint.x += padding;
+    maxPoint.y += padding;
+    maxPoint.z += padding;
+
+    const float centerY = 0.5f * (minPoint.y + maxPoint.y);
+    constexpr float kForestOctreeVerticalHalfSize = 128.0f;
+    minPoint.y = centerY - kForestOctreeVerticalHalfSize;
+    maxPoint.y = centerY + kForestOctreeVerticalHalfSize;
+
+    mForestOctreeRoot = std::make_unique<OctreeNode>();
+    mForestOctreeRoot->Bounds = MakeBoundingBox(minPoint, maxPoint);
+    mForestOctreeRoot->LooseBounds = mForestOctreeRoot->Bounds;
+
+    for (UINT objectIndex = 0; objectIndex < static_cast<UINT>(mForestObjects.size()); ++objectIndex)
+        InsertIntoOctree(*mForestOctreeRoot, objectIndex, 0);
+}
+
+void BoxApp::InsertIntoOctree(OctreeNode& node, UINT objectIndex, int depth)
+{
+    constexpr int kMaxDepth = 6;
+    if (depth >= kMaxDepth)
+    {
+        node.ObjectIndices.push_back(objectIndex);
+        return;
+    }
+
+    if (!node.Children[0])
+    {
+        const XMFLOAT3& c = node.Bounds.Center;
+        const XMFLOAT3& e = node.Bounds.Extents;
+        const XMFLOAT3 childExtents(0.5f * e.x, 0.5f * e.y, 0.5f * e.z);
+
+        UINT childIndex = 0;
+        for (int z = 0; z < 2; ++z)
+        {
+            for (int y = 0; y < 2; ++y)
+            {
+                for (int x = 0; x < 2; ++x)
+                {
+                    const float sx = x == 0 ? -1.0f : 1.0f;
+                    const float sy = y == 0 ? -1.0f : 1.0f;
+                    const float sz = z == 0 ? -1.0f : 1.0f;
+
+                    auto child = std::make_unique<OctreeNode>();
+                    const XMFLOAT3 childCenter(c.x + sx * childExtents.x, c.y + sy * childExtents.y, c.z + sz * childExtents.z);
+                    child->Bounds = BoundingBox(
+                        childCenter,
+                        childExtents);
+                    child->LooseBounds = BoundingBox(
+                        childCenter,
+                        XMFLOAT3(childExtents.x * 2.0f, childExtents.y * 2.0f, childExtents.z * 2.0f));
+                    node.Children[childIndex++] = std::move(child);
+                }
+            }
+        }
+    }
+
+    const BoundingBox& objectBounds = mForestObjects[objectIndex].Bounds;
+    UINT childIndex = 0;
+    childIndex |= objectBounds.Center.x >= node.Bounds.Center.x ? 1u : 0u;
+    childIndex |= objectBounds.Center.y >= node.Bounds.Center.y ? 2u : 0u;
+    childIndex |= objectBounds.Center.z >= node.Bounds.Center.z ? 4u : 0u;
+
+    const auto& child = node.Children[childIndex];
+    if (child && child->LooseBounds.Contains(objectBounds) == CONTAINS)
+    {
+        InsertIntoOctree(*child, objectIndex, depth + 1);
+        return;
+    }
+
+    node.ObjectIndices.push_back(objectIndex);
+}
+
+void BoxApp::QueryOctree(const OctreeNode& node, const BoundingFrustum& frustum, std::vector<UINT>& visibleBatches, UINT& visibleObjects) const
+{
+    const ContainmentType containment = frustum.Contains(node.LooseBounds);
+    if (containment == DISJOINT)
+        return;
+
+    if (containment == CONTAINS)
+    {
+        CollectOctreeBatches(node, visibleBatches, visibleObjects);
+        return;
+    }
+
+    for (UINT objectIndex : node.ObjectIndices)
+    {
+        const CullObject& object = mForestObjects[objectIndex];
+        if (frustum.Contains(object.Bounds) != DISJOINT)
+        {
+            visibleBatches.push_back(object.BatchIndex);
+            ++visibleObjects;
+        }
+    }
+
+    for (const auto& child : node.Children)
+    {
+        if (child)
+            QueryOctree(*child, frustum, visibleBatches, visibleObjects);
+    }
+}
+
+void BoxApp::CollectOctreeBatches(const OctreeNode& node, std::vector<UINT>& visibleBatches, UINT& visibleObjects) const
+{
+    for (UINT objectIndex : node.ObjectIndices)
+    {
+        visibleBatches.push_back(mForestObjects[objectIndex].BatchIndex);
+        ++visibleObjects;
+    }
+
+    for (const auto& child : node.Children)
+    {
+        if (child)
+            CollectOctreeBatches(*child, visibleBatches, visibleObjects);
+    }
 }
 
 void BoxApp::BuildDescriptorHeaps()
@@ -945,6 +1310,9 @@ void BoxApp::BuildBoxGeometry()
     mTextures.clear();
     mTextureIndexByName.clear();
     mDrawBatches.clear();
+    mVisibleBatchIndices.clear();
+    mForestObjects.clear();
+    mForestOctreeRoot.reset();
 
     const UINT whiteSrv = CreateSolidColorTexture("__white", { 255, 255, 255, 255 });
     const UINT flatNormalSrv = CreateSolidColorTexture("__flatNormal", { 128, 128, 255, 255 });
@@ -953,18 +1321,39 @@ void BoxApp::BuildBoxGeometry()
     std::vector<Vertex> vertices;
     std::vector<std::uint32_t> indices;
 
-    auto appendBatchGeometry = [&](const std::vector<Vertex>& batchVertices, const std::vector<std::uint32_t>& batchIndices, const DrawBatch& sourceBatch)
+    struct GeometryRange
     {
-        DrawBatch batch = sourceBatch;
-        batch.StartIndexLocation = static_cast<UINT>(indices.size());
-        batch.IndexCount = static_cast<UINT>(batchIndices.size());
+        UINT IndexCount = 0;
+        UINT StartIndexLocation = 0;
+        BoundingBox LocalBounds;
+    };
+
+    auto appendGeometry = [&](const std::vector<Vertex>& batchVertices, const std::vector<std::uint32_t>& batchIndices)
+    {
+        GeometryRange range;
+        range.StartIndexLocation = static_cast<UINT>(indices.size());
+        range.IndexCount = static_cast<UINT>(batchIndices.size());
+        range.LocalBounds = ComputeLocalBounds(batchVertices);
 
         const std::uint32_t baseVertex = static_cast<std::uint32_t>(vertices.size());
         vertices.insert(vertices.end(), batchVertices.begin(), batchVertices.end());
         for (std::uint32_t idx : batchIndices)
             indices.push_back(baseVertex + idx);
 
+        return range;
+    };
+
+    auto appendBatchGeometry = [&](const std::vector<Vertex>& batchVertices, const std::vector<std::uint32_t>& batchIndices, const DrawBatch& sourceBatch)
+    {
+        DrawBatch batch = sourceBatch;
+        const GeometryRange range = appendGeometry(batchVertices, batchIndices);
+        batch.StartIndexLocation = range.StartIndexLocation;
+        batch.IndexCount = range.IndexCount;
+        batch.Bounds = TransformBounds(range.LocalBounds, batch.World);
+
+        const UINT batchIndex = static_cast<UINT>(mDrawBatches.size());
         mDrawBatches.push_back(batch);
+        return batchIndex;
     };
 
     {
@@ -1164,7 +1553,105 @@ void BoxApp::BuildBoxGeometry()
         waterBatch.Tint = XMFLOAT4(0.72f, 0.86f, 0.98f, 1.0f);
         XMStoreFloat4x4(&waterBatch.World, XMMatrixTranslation(-6.65f, 0.06f, -0.45f));
         addGeneratedMesh(geoGen.CreateGrid(6.0f, 4.0f, 8, 8), waterBatch);
+
+        constexpr int kTreeColumns = 200;
+        constexpr int kTreeRows = 100;
+        constexpr UINT kTreeCount = kTreeColumns * kTreeRows;
+        constexpr float kTreeSpacing = 1.65f;
+        constexpr float kForestPadding = 16.0f;
+        constexpr float kForestWidth = static_cast<float>(kTreeColumns - 1) * kTreeSpacing + kForestPadding;
+        constexpr float kForestDepth = static_cast<float>(kTreeRows - 1) * kTreeSpacing + kForestPadding;
+
+        DrawBatch fieldBatch;
+        fieldBatch.SceneId = kSceneForest;
+        fieldBatch.DiffuseSrvIndex = LoadOrCreateTexture(texturesBase, "grass.dds");
+        fieldBatch.NormalSrvIndex = LoadOrCreateTexture(texturesBase, "default_nmap.dds");
+        fieldBatch.DisplacementSrvIndex = neutralDisplacementSrv;
+        fieldBatch.UvScale = XMFLOAT2(kForestWidth * 0.2f, kForestDepth * 0.2f);
+        fieldBatch.Tint = XMFLOAT4(0.72f, 0.92f, 0.58f, 1.0f);
+        addGeneratedMesh(geoGen.CreateGrid(kForestWidth, kForestDepth, 96, 96), fieldBatch);
+
+        const UINT treeAtlasSrv = CreateRgbaTexture("__treeAtlas", 2, 1,
+            std::vector<std::uint8_t>
+            {
+                112, 73, 42, 255,
+                35, 115, 47, 255
+            });
+
+        std::vector<Vertex> treeVertices;
+        std::vector<std::uint32_t> treeIndices;
+
+        auto appendTreeMesh = [&](const GeometryGenerator::MeshData& meshData, FXMMATRIX transform, float atlasU)
+        {
+            const std::uint32_t baseVertex = static_cast<std::uint32_t>(treeVertices.size());
+            treeVertices.reserve(treeVertices.size() + meshData.Vertices.size());
+
+            for (const auto& srcVertex : meshData.Vertices)
+            {
+                Vertex v = {};
+                XMStoreFloat3(&v.Pos, XMVector3Transform(XMLoadFloat3(&srcVertex.Position), transform));
+                XMStoreFloat3(&v.Normal, XMVector3Normalize(XMVector3TransformNormal(XMLoadFloat3(&srcVertex.Normal), transform)));
+                XMStoreFloat3(&v.Tangent, XMVector3Normalize(XMVector3TransformNormal(XMLoadFloat3(&srcVertex.TangentU), transform)));
+                v.TexC = XMFLOAT2(atlasU, 0.5f);
+                treeVertices.push_back(v);
+            }
+
+            treeIndices.reserve(treeIndices.size() + meshData.Indices32.size());
+            for (std::uint32_t index : meshData.Indices32)
+                treeIndices.push_back(baseVertex + index);
+        };
+
+        appendTreeMesh(geoGen.CreateCylinder(0.10f, 0.08f, 0.95f, 6, 1), XMMatrixTranslation(0.0f, 0.475f, 0.0f), 0.25f);
+        appendTreeMesh(geoGen.CreateCylinder(0.78f, 0.14f, 1.25f, 8, 1), XMMatrixTranslation(0.0f, 1.35f, 0.0f), 0.75f);
+        appendTreeMesh(geoGen.CreateCylinder(0.56f, 0.04f, 0.95f, 8, 1), XMMatrixTranslation(0.0f, 2.00f, 0.0f), 0.75f);
+
+        const GeometryRange treeRange = appendGeometry(treeVertices, treeIndices);
+
+        std::mt19937 rng(20260425u);
+        std::uniform_real_distribution<float> jitter(-0.46f, 0.46f);
+        std::uniform_real_distribution<float> treeScale(0.78f, 1.24f);
+        std::uniform_real_distribution<float> treeHeight(0.86f, 1.48f);
+        std::uniform_real_distribution<float> treeRotation(0.0f, MathHelper::Pi * 2.0f);
+
+        mDrawBatches.reserve(mDrawBatches.size() + kTreeCount);
+        mForestObjects.reserve(kTreeCount);
+
+        const float halfForestX = 0.5f * static_cast<float>(kTreeColumns - 1) * kTreeSpacing;
+        const float halfForestZ = 0.5f * static_cast<float>(kTreeRows - 1) * kTreeSpacing;
+
+        for (int z = 0; z < kTreeRows; ++z)
+        {
+            for (int x = 0; x < kTreeColumns; ++x)
+            {
+                const float px = static_cast<float>(x) * kTreeSpacing - halfForestX + jitter(rng);
+                const float pz = static_cast<float>(z) * kTreeSpacing - halfForestZ + jitter(rng);
+                const float sxz = treeScale(rng);
+                const float sy = treeHeight(rng);
+
+                DrawBatch treeBatch;
+                treeBatch.IndexCount = treeRange.IndexCount;
+                treeBatch.StartIndexLocation = treeRange.StartIndexLocation;
+                treeBatch.DiffuseSrvIndex = treeAtlasSrv;
+                treeBatch.NormalSrvIndex = flatNormalSrv;
+                treeBatch.DisplacementSrvIndex = neutralDisplacementSrv;
+                treeBatch.SceneId = kSceneForest;
+                treeBatch.Cullable = true;
+
+                XMStoreFloat4x4(&treeBatch.World,
+                    XMMatrixScaling(sxz, sy, sxz) *
+                    XMMatrixRotationY(treeRotation(rng)) *
+                    XMMatrixTranslation(px, 0.0f, pz));
+                treeBatch.Bounds = TransformBounds(treeRange.LocalBounds, treeBatch.World);
+
+                const UINT batchIndex = static_cast<UINT>(mDrawBatches.size());
+                treeBatch.CullObjectIndex = static_cast<UINT>(mForestObjects.size());
+                mDrawBatches.push_back(treeBatch);
+                mForestObjects.push_back({ treeBatch.Bounds, batchIndex });
+            }
+        }
     }
+
+    BuildForestOctree();
 
     const UINT vbByteSize = static_cast<UINT>(vertices.size() * sizeof(Vertex));
     const UINT ibByteSize = static_cast<UINT>(indices.size() * sizeof(std::uint32_t));
