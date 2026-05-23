@@ -129,6 +129,7 @@ GBufferOut GBufferPS(SurfaceOut pin)
 {
     GBufferOut o;
     float4 albedo = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC) * gTint;
+    clip(albedo.a - 0.35f);
     float3 normalTS = SampleNormalTS(pin.TexC);
     float3 normalW = TangentToWorld(normalTS, normalize(pin.NormalW), normalize(pin.TangentW));
     o.Albedo = albedo;

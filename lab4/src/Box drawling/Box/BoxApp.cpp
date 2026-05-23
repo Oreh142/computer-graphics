@@ -34,6 +34,8 @@ namespace
     constexpr UINT kSceneSponza = 0;
     constexpr UINT kSceneForest = 1;
     constexpr UINT kInvalidIndex = (std::numeric_limits<UINT>::max)();
+    constexpr float kTreeBillboardDistance = 30.0f;
+    constexpr float kTreeBillboardDistanceSq = kTreeBillboardDistance * kTreeBillboardDistance;
 }
 
 struct Vertex
@@ -170,6 +172,21 @@ namespace
         return transformed;
     }
 
+    BoundingBox MergeBounds(const BoundingBox& a, const BoundingBox& b)
+    {
+        const XMFLOAT3 minPoint(
+            (std::min)(a.Center.x - a.Extents.x, b.Center.x - b.Extents.x),
+            (std::min)(a.Center.y - a.Extents.y, b.Center.y - b.Extents.y),
+            (std::min)(a.Center.z - a.Extents.z, b.Center.z - b.Extents.z));
+
+        const XMFLOAT3 maxPoint(
+            (std::max)(a.Center.x + a.Extents.x, b.Center.x + b.Extents.x),
+            (std::max)(a.Center.y + a.Extents.y, b.Center.y + b.Extents.y),
+            (std::max)(a.Center.z + a.Extents.z, b.Center.z + b.Extents.z));
+
+        return MakeBoundingBox(minPoint, maxPoint);
+    }
+
     XMFLOAT3 BuildFallbackTangent(const XMFLOAT3& normal)
     {
         XMVECTOR n = XMVector3Normalize(XMLoadFloat3(&normal));
@@ -275,14 +292,20 @@ private:
     virtual void OnMouseUp(WPARAM btnState, int x, int y)override;
     virtual void OnMouseMove(WPARAM btnState, int x, int y)override;
 
+    struct CullObject;
     struct OctreeNode;
 
     void SetActiveScene(UINT sceneId);
     void UpdateVisibleBatches();
+    UINT SelectTreeBatch(const CullObject& object, const XMFLOAT3& cameraPos) const;
+    void AddVisibleTreeObject(UINT objectIndex, const XMFLOAT3& cameraPos, std::vector<UINT>& visibleBatches,
+        UINT& visibleObjects, UINT& visibleMeshObjects, UINT& visibleBillboardObjects) const;
     void BuildForestOctree();
     void InsertIntoOctree(OctreeNode& node, UINT objectIndex, int depth);
-    void QueryOctree(const OctreeNode& node, const BoundingFrustum& frustum, std::vector<UINT>& visibleBatches, UINT& visibleObjects) const;
-    void CollectOctreeBatches(const OctreeNode& node, std::vector<UINT>& visibleBatches, UINT& visibleObjects) const;
+    void QueryOctree(const OctreeNode& node, const BoundingFrustum& frustum, const XMFLOAT3& cameraPos,
+        std::vector<UINT>& visibleBatches, UINT& visibleObjects, UINT& visibleMeshObjects, UINT& visibleBillboardObjects) const;
+    void CollectOctreeBatches(const OctreeNode& node, const XMFLOAT3& cameraPos,
+        std::vector<UINT>& visibleBatches, UINT& visibleObjects, UINT& visibleMeshObjects, UINT& visibleBillboardObjects) const;
     void BuildDescriptorHeaps();
     void BuildDeferredSrvHeap();
     void UpdateDeferredSrvDescriptors();
@@ -309,8 +332,12 @@ private:
         bool Tessellated = false;
         bool AnimateUv = false;
         bool Cullable = false;
+        bool Billboard = false;
         XMFLOAT2 UvScale = XMFLOAT2(1.0f, 1.0f);
         float DisplacementScale = 0.0f;
+        float BillboardWidth = 1.0f;
+        float BillboardHeight = 1.0f;
+        XMFLOAT3 BillboardBase = XMFLOAT3(0.0f, 0.0f, 0.0f);
         float Padding = 0.0f;
         XMFLOAT4 Tint = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
         XMFLOAT4X4 World = MathHelper::Identity4x4();
@@ -320,7 +347,11 @@ private:
     struct CullObject
     {
         BoundingBox Bounds;
-        UINT BatchIndex = 0;
+        UINT MeshBatchIndex = 0;
+        UINT BillboardBatchIndex = 0;
+        XMFLOAT3 Position = XMFLOAT3(0.0f, 0.0f, 0.0f);
+        float BillboardWidth = 1.0f;
+        float BillboardHeight = 1.0f;
     };
 
     struct OctreeNode
@@ -360,6 +391,7 @@ private:
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
 
     ComPtr<ID3D12PipelineState> mGBufferPSO = nullptr;
+    ComPtr<ID3D12PipelineState> mGBufferBillboardPSO = nullptr;
     ComPtr<ID3D12PipelineState> mGBufferTessPSO = nullptr;
     ComPtr<ID3D12PipelineState> mLightingPSO = nullptr;
     ComPtr<ID3D12PipelineState> mTessWirePSO = nullptr;
@@ -381,6 +413,8 @@ private:
     float mTessMaxFactor = 12.0f;
     UINT mActiveScene = kSceneSponza;
     UINT mVisibleCullObjectCount = 0;
+    UINT mVisibleTreeMeshCount = 0;
+    UINT mVisibleTreeBillboardCount = 0;
     bool mScene1KeyWasDown = false;
     bool mScene2KeyWasDown = false;
     bool mFrustumCullingEnabled = true;
@@ -486,6 +520,8 @@ void BoxApp::UpdateVisibleBatches()
 {
     mVisibleBatchIndices.clear();
     mVisibleCullObjectCount = 0;
+    mVisibleTreeMeshCount = 0;
+    mVisibleTreeBillboardCount = 0;
 
     auto addSceneNonCullableBatches = [&]()
     {
@@ -502,12 +538,15 @@ void BoxApp::UpdateVisibleBatches()
     if (mActiveScene != kSceneForest)
         return;
 
+    const XMFLOAT3 cameraPos = mCamera.GetPosition3f();
+
     if (!mFrustumCullingEnabled)
     {
-        for (const CullObject& object : mForestObjects)
-            mVisibleBatchIndices.push_back(object.BatchIndex);
-
-        mVisibleCullObjectCount = static_cast<UINT>(mForestObjects.size());
+        for (UINT objectIndex = 0; objectIndex < static_cast<UINT>(mForestObjects.size()); ++objectIndex)
+        {
+            AddVisibleTreeObject(objectIndex, cameraPos, mVisibleBatchIndices, mVisibleCullObjectCount,
+                mVisibleTreeMeshCount, mVisibleTreeBillboardCount);
+        }
         return;
     }
 
@@ -520,7 +559,8 @@ void BoxApp::UpdateVisibleBatches()
 
     if (mOctreeCullingEnabled && mForestOctreeRoot)
     {
-        QueryOctree(*mForestOctreeRoot, worldSpaceFrustum, mVisibleBatchIndices, mVisibleCullObjectCount);
+        QueryOctree(*mForestOctreeRoot, worldSpaceFrustum, cameraPos, mVisibleBatchIndices, mVisibleCullObjectCount,
+            mVisibleTreeMeshCount, mVisibleTreeBillboardCount);
     }
     else
     {
@@ -529,11 +569,35 @@ void BoxApp::UpdateVisibleBatches()
             const CullObject& object = mForestObjects[objectIndex];
             if (worldSpaceFrustum.Contains(object.Bounds) != DISJOINT)
             {
-                mVisibleBatchIndices.push_back(object.BatchIndex);
-                ++mVisibleCullObjectCount;
+                AddVisibleTreeObject(objectIndex, cameraPos, mVisibleBatchIndices, mVisibleCullObjectCount,
+                    mVisibleTreeMeshCount, mVisibleTreeBillboardCount);
             }
         }
     }
+}
+
+UINT BoxApp::SelectTreeBatch(const CullObject& object, const XMFLOAT3& cameraPos) const
+{
+    const XMFLOAT3& center = object.Bounds.Center;
+    const float dx = cameraPos.x - center.x;
+    const float dy = cameraPos.y - center.y;
+    const float dz = cameraPos.z - center.z;
+    const float distSq = dx * dx + dy * dy + dz * dz;
+    return (distSq > kTreeBillboardDistanceSq) ? object.BillboardBatchIndex : object.MeshBatchIndex;
+}
+
+void BoxApp::AddVisibleTreeObject(UINT objectIndex, const XMFLOAT3& cameraPos, std::vector<UINT>& visibleBatches,
+    UINT& visibleObjects, UINT& visibleMeshObjects, UINT& visibleBillboardObjects) const
+{
+    const CullObject& object = mForestObjects[objectIndex];
+    const UINT batchIndex = SelectTreeBatch(object, cameraPos);
+    visibleBatches.push_back(batchIndex);
+    ++visibleObjects;
+
+    if (batchIndex == object.BillboardBatchIndex)
+        ++visibleBillboardObjects;
+    else
+        ++visibleMeshObjects;
 }
 
 std::wstring BoxApp::GetAdditionalWindowText() const
@@ -564,7 +628,8 @@ std::wstring BoxApp::GetAdditionalWindowText() const
         << L" | debug: " << kDebugViewNames[mDebugView]
         << L" | tex anim: " << (mTextureAnimationEnabled ? L"on" : L"off")
         << L" | culling: " << cullingMode
-        << L" | visible: " << mVisibleCullObjectCount << L"/" << mForestObjects.size();
+        << L" | visible: " << mVisibleCullObjectCount << L"/" << mForestObjects.size()
+        << L" | lod mesh/bb: " << mVisibleTreeMeshCount << L"/" << mVisibleTreeBillboardCount;
 
     return stream.str();
 }
@@ -631,6 +696,24 @@ void BoxApp::Update(const GameTimer& gt)
     const XMMATRIX viewProj = view * proj;
     const XMFLOAT3 cameraPos = mCamera.GetPosition3f();
 
+    for (UINT batchIndex : mVisibleBatchIndices)
+    {
+        DrawBatch& batch = mDrawBatches[batchIndex];
+        if (!batch.Billboard)
+            continue;
+
+        const float dx = cameraPos.x - batch.BillboardBase.x;
+        const float dz = cameraPos.z - batch.BillboardBase.z;
+        if (dx * dx + dz * dz < 1e-6f)
+            continue;
+
+        const float yaw = std::atan2(dx, dz);
+        XMStoreFloat4x4(&batch.World,
+            XMMatrixScaling(batch.BillboardWidth, batch.BillboardHeight, 1.0f) *
+            XMMatrixRotationY(yaw) *
+            XMMatrixTranslation(batch.BillboardBase.x, batch.BillboardBase.y, batch.BillboardBase.z));
+    }
+
     for (size_t i = 0; i < mDrawBatches.size(); ++i)
     {
         const DrawBatch& batch = mDrawBatches[i];
@@ -640,7 +723,7 @@ void BoxApp::Update(const GameTimer& gt)
         XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
         XMStoreFloat4x4(&objConstants.ViewProj, XMMatrixTranspose(viewProj));
         objConstants.UvScale = batch.UvScale;
-        objConstants.UvOffset = mAnimatedUvOffset;
+        objConstants.UvOffset = batch.AnimateUv ? mAnimatedUvOffset : XMFLOAT2(0.0f, 0.0f);
         objConstants.Tint = batch.Tint;
         objConstants.CameraPosW = cameraPos;
         objConstants.DisplacementScale = batch.DisplacementScale;
@@ -711,7 +794,7 @@ void BoxApp::Draw(const GameTimer& gt)
     const auto baseSrvHandle = mCbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
     const D3D12_GPU_VIRTUAL_ADDRESS objectCbAddress = mObjectCB->Resource()->GetGPUVirtualAddress();
 
-    auto drawBatches = [&](bool tessellated, ID3D12PipelineState* pso, D3D_PRIMITIVE_TOPOLOGY topology)
+    auto drawBatches = [&](bool tessellated, bool billboard, ID3D12PipelineState* pso, D3D_PRIMITIVE_TOPOLOGY topology)
     {
         mCommandList->SetPipelineState(pso);
         mCommandList->IASetPrimitiveTopology(topology);
@@ -719,7 +802,7 @@ void BoxApp::Draw(const GameTimer& gt)
         for (UINT batchIndex : mVisibleBatchIndices)
         {
             const DrawBatch& batch = mDrawBatches[batchIndex];
-            if (batch.Tessellated != tessellated)
+            if (batch.Tessellated != tessellated || batch.Billboard != billboard)
                 continue;
 
             auto diffuseHandle = baseSrvHandle;
@@ -737,8 +820,9 @@ void BoxApp::Draw(const GameTimer& gt)
         }
     };
 
-    drawBatches(false, mGBufferPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    drawBatches(true, mGBufferTessPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+    drawBatches(false, false, mGBufferPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    drawBatches(false, true, mGBufferBillboardPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    drawBatches(true, false, mGBufferTessPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
 
     CD3DX12_RESOURCE_BARRIER toLighting[4] =
     {
@@ -1089,7 +1173,8 @@ void BoxApp::InsertIntoOctree(OctreeNode& node, UINT objectIndex, int depth)
     node.ObjectIndices.push_back(objectIndex);
 }
 
-void BoxApp::QueryOctree(const OctreeNode& node, const BoundingFrustum& frustum, std::vector<UINT>& visibleBatches, UINT& visibleObjects) const
+void BoxApp::QueryOctree(const OctreeNode& node, const BoundingFrustum& frustum, const XMFLOAT3& cameraPos,
+    std::vector<UINT>& visibleBatches, UINT& visibleObjects, UINT& visibleMeshObjects, UINT& visibleBillboardObjects) const
 {
     const ContainmentType containment = frustum.Contains(node.LooseBounds);
     if (containment == DISJOINT)
@@ -1097,7 +1182,7 @@ void BoxApp::QueryOctree(const OctreeNode& node, const BoundingFrustum& frustum,
 
     if (containment == CONTAINS)
     {
-        CollectOctreeBatches(node, visibleBatches, visibleObjects);
+        CollectOctreeBatches(node, cameraPos, visibleBatches, visibleObjects, visibleMeshObjects, visibleBillboardObjects);
         return;
     }
 
@@ -1106,30 +1191,33 @@ void BoxApp::QueryOctree(const OctreeNode& node, const BoundingFrustum& frustum,
         const CullObject& object = mForestObjects[objectIndex];
         if (frustum.Contains(object.Bounds) != DISJOINT)
         {
-            visibleBatches.push_back(object.BatchIndex);
-            ++visibleObjects;
+            AddVisibleTreeObject(objectIndex, cameraPos, visibleBatches, visibleObjects,
+                visibleMeshObjects, visibleBillboardObjects);
         }
     }
 
     for (const auto& child : node.Children)
     {
         if (child)
-            QueryOctree(*child, frustum, visibleBatches, visibleObjects);
+            QueryOctree(*child, frustum, cameraPos, visibleBatches, visibleObjects,
+                visibleMeshObjects, visibleBillboardObjects);
     }
 }
 
-void BoxApp::CollectOctreeBatches(const OctreeNode& node, std::vector<UINT>& visibleBatches, UINT& visibleObjects) const
+void BoxApp::CollectOctreeBatches(const OctreeNode& node, const XMFLOAT3& cameraPos,
+    std::vector<UINT>& visibleBatches, UINT& visibleObjects, UINT& visibleMeshObjects, UINT& visibleBillboardObjects) const
 {
     for (UINT objectIndex : node.ObjectIndices)
     {
-        visibleBatches.push_back(mForestObjects[objectIndex].BatchIndex);
-        ++visibleObjects;
+        AddVisibleTreeObject(objectIndex, cameraPos, visibleBatches, visibleObjects,
+            visibleMeshObjects, visibleBillboardObjects);
     }
 
     for (const auto& child : node.Children)
     {
         if (child)
-            CollectOctreeBatches(*child, visibleBatches, visibleObjects);
+            CollectOctreeBatches(*child, cameraPos, visibleBatches, visibleObjects,
+                visibleMeshObjects, visibleBillboardObjects);
     }
 }
 
@@ -1577,6 +1665,7 @@ void BoxApp::BuildBoxGeometry()
                 112, 73, 42, 255,
                 35, 115, 47, 255
             });
+        const UINT treeBillboardSrv = LoadOrCreateTexture(texturesBase, "tree01S.dds");
 
         std::vector<Vertex> treeVertices;
         std::vector<std::uint32_t> treeIndices;
@@ -1607,13 +1696,23 @@ void BoxApp::BuildBoxGeometry()
 
         const GeometryRange treeRange = appendGeometry(treeVertices, treeIndices);
 
+        const std::vector<Vertex> billboardVertices =
+        {
+            { XMFLOAT3(-0.5f, 0.0f, 0.0f), XMFLOAT3(0.0f, 0.0f, 1.0f), XMFLOAT3(1.0f, 0.0f, 0.0f), XMFLOAT2(0.0f, 1.0f) },
+            { XMFLOAT3(-0.5f, 1.0f, 0.0f), XMFLOAT3(0.0f, 0.0f, 1.0f), XMFLOAT3(1.0f, 0.0f, 0.0f), XMFLOAT2(0.0f, 0.0f) },
+            { XMFLOAT3(0.5f, 1.0f, 0.0f), XMFLOAT3(0.0f, 0.0f, 1.0f), XMFLOAT3(1.0f, 0.0f, 0.0f), XMFLOAT2(1.0f, 0.0f) },
+            { XMFLOAT3(0.5f, 0.0f, 0.0f), XMFLOAT3(0.0f, 0.0f, 1.0f), XMFLOAT3(1.0f, 0.0f, 0.0f), XMFLOAT2(1.0f, 1.0f) }
+        };
+        const std::vector<std::uint32_t> billboardIndices = { 0, 1, 2, 0, 2, 3 };
+        const GeometryRange billboardRange = appendGeometry(billboardVertices, billboardIndices);
+
         std::mt19937 rng(20260425u);
         std::uniform_real_distribution<float> jitter(-0.46f, 0.46f);
         std::uniform_real_distribution<float> treeScale(0.78f, 1.24f);
         std::uniform_real_distribution<float> treeHeight(0.86f, 1.48f);
         std::uniform_real_distribution<float> treeRotation(0.0f, MathHelper::Pi * 2.0f);
 
-        mDrawBatches.reserve(mDrawBatches.size() + kTreeCount);
+        mDrawBatches.reserve(mDrawBatches.size() + kTreeCount * 2);
         mForestObjects.reserve(kTreeCount);
 
         const float halfForestX = 0.5f * static_cast<float>(kTreeColumns - 1) * kTreeSpacing;
@@ -1627,6 +1726,12 @@ void BoxApp::BuildBoxGeometry()
                 const float pz = static_cast<float>(z) * kTreeSpacing - halfForestZ + jitter(rng);
                 const float sxz = treeScale(rng);
                 const float sy = treeHeight(rng);
+                const float treeWorldWidth = treeRange.LocalBounds.Extents.x * 2.0f * sxz;
+                const float treeWorldHeight = (treeRange.LocalBounds.Center.y + treeRange.LocalBounds.Extents.y) * sy;
+                const float billboardWidth = treeWorldWidth * 1.08f;
+                const float billboardHeight = treeWorldHeight * 1.04f;
+                const XMFLOAT3 billboardBase(px, 0.0f, pz);
+                const UINT cullObjectIndex = static_cast<UINT>(mForestObjects.size());
 
                 DrawBatch treeBatch;
                 treeBatch.IndexCount = treeRange.IndexCount;
@@ -1636,6 +1741,7 @@ void BoxApp::BuildBoxGeometry()
                 treeBatch.DisplacementSrvIndex = neutralDisplacementSrv;
                 treeBatch.SceneId = kSceneForest;
                 treeBatch.Cullable = true;
+                treeBatch.CullObjectIndex = cullObjectIndex;
 
                 XMStoreFloat4x4(&treeBatch.World,
                     XMMatrixScaling(sxz, sy, sxz) *
@@ -1643,10 +1749,32 @@ void BoxApp::BuildBoxGeometry()
                     XMMatrixTranslation(px, 0.0f, pz));
                 treeBatch.Bounds = TransformBounds(treeRange.LocalBounds, treeBatch.World);
 
-                const UINT batchIndex = static_cast<UINT>(mDrawBatches.size());
-                treeBatch.CullObjectIndex = static_cast<UINT>(mForestObjects.size());
+                DrawBatch billboardBatch;
+                billboardBatch.IndexCount = billboardRange.IndexCount;
+                billboardBatch.StartIndexLocation = billboardRange.StartIndexLocation;
+                billboardBatch.DiffuseSrvIndex = treeBillboardSrv;
+                billboardBatch.NormalSrvIndex = flatNormalSrv;
+                billboardBatch.DisplacementSrvIndex = neutralDisplacementSrv;
+                billboardBatch.SceneId = kSceneForest;
+                billboardBatch.Cullable = true;
+                billboardBatch.Billboard = true;
+                billboardBatch.CullObjectIndex = cullObjectIndex;
+                billboardBatch.BillboardWidth = billboardWidth;
+                billboardBatch.BillboardHeight = billboardHeight;
+                billboardBatch.BillboardBase = billboardBase;
+                XMStoreFloat4x4(&billboardBatch.World,
+                    XMMatrixScaling(billboardWidth, billboardHeight, 1.0f) *
+                    XMMatrixTranslation(px, 0.0f, pz));
+                billboardBatch.Bounds = BoundingBox(
+                    XMFLOAT3(px, billboardHeight * 0.5f, pz),
+                    XMFLOAT3(billboardWidth * 0.5f, billboardHeight * 0.5f, billboardWidth * 0.5f));
+
+                const BoundingBox cullBounds = MergeBounds(treeBatch.Bounds, billboardBatch.Bounds);
+                const UINT meshBatchIndex = static_cast<UINT>(mDrawBatches.size());
                 mDrawBatches.push_back(treeBatch);
-                mForestObjects.push_back({ treeBatch.Bounds, batchIndex });
+                const UINT billboardBatchIndex = static_cast<UINT>(mDrawBatches.size());
+                mDrawBatches.push_back(billboardBatch);
+                mForestObjects.push_back({ cullBounds, meshBatchIndex, billboardBatchIndex, billboardBase, billboardWidth, billboardHeight });
             }
         }
     }
@@ -1708,6 +1836,10 @@ void BoxApp::BuildPSOs()
     gbufferPsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
     gbufferPsoDesc.DSVFormat = mDepthStencilFormat;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&gbufferPsoDesc, IID_PPV_ARGS(&mGBufferPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC billboardPsoDesc = gbufferPsoDesc;
+    billboardPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&billboardPsoDesc, IID_PPV_ARGS(&mGBufferBillboardPSO)));
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC gbufferTessPsoDesc = gbufferPsoDesc;
     gbufferTessPsoDesc.VS =
