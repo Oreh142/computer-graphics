@@ -45,6 +45,20 @@ struct DeferredPassConstants
     UINT SpotLightCount = 0;
     UINT DebugView = 0;
     float Ambient = 0.001f;
+    XMFLOAT4X4 ShadowTransforms[4] =
+    {
+        MathHelper::Identity4x4(),
+        MathHelper::Identity4x4(),
+        MathHelper::Identity4x4(),
+        MathHelper::Identity4x4()
+    };
+    XMFLOAT4 CascadeSplits = XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
+    XMFLOAT2 ShadowTexelSize = XMFLOAT2(1.0f / 1024.0f, 1.0f / 1024.0f);
+    float ShadowBias = 0.0015f;
+    UINT ShadowCascadeCount = 0;
+    UINT ShadowQuality = 1;
+    UINT ShadowsEnabled = 0;
+    XMFLOAT2 ShadowPadding = XMFLOAT2(0.0f, 0.0f);
     PointLight PointLights[16];
     DirectionalLight DirectionalLights[8];
     SpotLight SpotLights[8];

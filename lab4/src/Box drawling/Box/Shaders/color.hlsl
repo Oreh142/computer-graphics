@@ -17,6 +17,7 @@ Texture2D gDiffuseMap : register(t0);
 Texture2D gNormalMap : register(t1);
 Texture2D gDisplacementMap : register(t2);
 SamplerState gsamLinearWrap : register(s0);
+SamplerComparisonState gsamShadow : register(s1);
 
 struct VertexIn
 {
@@ -137,6 +138,27 @@ GBufferOut GBufferPS(SurfaceOut pin)
     return o;
 }
 
+struct ShadowOut
+{
+    float4 PosH : SV_POSITION;
+    float2 TexC : TEXCOORD;
+};
+
+ShadowOut ShadowVS(VertexIn vin)
+{
+    ShadowOut o;
+    float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
+    o.PosH = mul(posW, gViewProj);
+    o.TexC = vin.TexC * gUvScale + gUvOffset;
+    return o;
+}
+
+void ShadowPS(ShadowOut pin)
+{
+    float4 albedo = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC) * gTint;
+    clip(albedo.a - 0.35f);
+}
+
 struct HullIn
 {
     float3 PosL : POSITION;
@@ -240,10 +262,12 @@ FSOut LightingVS(uint vid : SV_VertexID)
 Texture2D gAlbedoMap : register(t0);
 Texture2D gNormalBufferMap : register(t1);
 Texture2D gDepthMap : register(t2);
+Texture2DArray gShadowMap : register(t3);
 
 #define MAX_POINT_LIGHTS 16
 #define MAX_DIRECTIONAL_LIGHTS 8
 #define MAX_SPOT_LIGHTS 8
+#define MAX_SHADOW_CASCADES 4
 
 struct PointLight
 {
@@ -283,20 +307,92 @@ cbuffer cbLighting : register(b1)
     uint gSpotLightCount;
     uint gDebugView;
     float gAmbient;
+    float4x4 gShadowTransforms[MAX_SHADOW_CASCADES];
+    float4 gCascadeSplits;
+    float2 gShadowTexelSize;
+    float gShadowBias;
+    uint gShadowCascadeCount;
+    uint gShadowQuality;
+    uint gShadowsEnabled;
+    float2 gShadowPadding;
 
     PointLight gPointLights[MAX_POINT_LIGHTS];
     DirectionalLight gDirectionalLights[MAX_DIRECTIONAL_LIGHTS];
     SpotLight gSpotLights[MAX_SPOT_LIGHTS];
 };
 
-float3 ReconstructWorldPos(float2 uv, float depthNdc)
+float3 ReconstructViewPos(float2 uv, float depthNdc)
 {
     float ndcX = uv.x * 2.0f - 1.0f;
     float ndcY = 1.0f - uv.y * 2.0f;
     float4 posV = mul(float4(ndcX, ndcY, depthNdc, 1.0f), gInvProj);
     posV /= max(posV.w, 1e-6f);
-    float4 posW = mul(posV, gInvView);
+    return posV.xyz;
+}
+
+float3 ReconstructWorldPos(float3 posV)
+{
+    float4 posW = mul(float4(posV, 1.0f), gInvView);
     return posW.xyz;
+}
+
+uint SelectShadowCascade(float viewDepth)
+{
+    [unroll]
+    for (uint cascadeIndex = 0; cascadeIndex < MAX_SHADOW_CASCADES; ++cascadeIndex)
+    {
+        if (cascadeIndex >= gShadowCascadeCount)
+            break;
+        if (viewDepth <= gCascadeSplits[cascadeIndex])
+            return cascadeIndex;
+    }
+
+    return gShadowCascadeCount;
+}
+
+float SampleShadowFactor(float3 posW, float viewDepth)
+{
+    if (gShadowsEnabled == 0 || gShadowCascadeCount == 0)
+        return 1.0f;
+
+    uint cascadeIndex = SelectShadowCascade(viewDepth);
+    if (cascadeIndex >= gShadowCascadeCount)
+        return 1.0f;
+
+    float4 shadowPos = mul(float4(posW, 1.0f), gShadowTransforms[cascadeIndex]);
+    shadowPos.xyz /= max(shadowPos.w, 1e-6f);
+
+    float2 uv = float2(0.5f * shadowPos.x + 0.5f, -0.5f * shadowPos.y + 0.5f);
+    float depth = shadowPos.z - gShadowBias;
+
+    if (uv.x <= 0.0f || uv.x >= 1.0f || uv.y <= 0.0f || uv.y >= 1.0f || depth <= 0.0f || depth >= 1.0f)
+        return 1.0f;
+
+    if (gShadowQuality >= 2)
+    {
+        float shadow = 0.0f;
+        [unroll]
+        for (int y = -1; y <= 1; ++y)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; ++x)
+            {
+                float2 offset = float2(x, y) * gShadowTexelSize;
+                shadow += gShadowMap.SampleCmpLevelZero(gsamShadow, float3(uv + offset, cascadeIndex), depth);
+            }
+        }
+
+        return shadow / 9.0f;
+    }
+
+    float2 halfTexel = 0.5f * gShadowTexelSize;
+    float shadow2x2 =
+        gShadowMap.SampleCmpLevelZero(gsamShadow, float3(uv + float2(-halfTexel.x, -halfTexel.y), cascadeIndex), depth) +
+        gShadowMap.SampleCmpLevelZero(gsamShadow, float3(uv + float2(halfTexel.x, -halfTexel.y), cascadeIndex), depth) +
+        gShadowMap.SampleCmpLevelZero(gsamShadow, float3(uv + float2(-halfTexel.x, halfTexel.y), cascadeIndex), depth) +
+        gShadowMap.SampleCmpLevelZero(gsamShadow, float3(uv + float2(halfTexel.x, halfTexel.y), cascadeIndex), depth);
+
+    return shadow2x2 * 0.25f;
 }
 
 float3 EvaluateDirectionalLight(float3 albedo, float3 normalW, DirectionalLight light)
@@ -348,7 +444,8 @@ float4 LightingPS(FSOut pin) : SV_Target
     float depthNdc = gDepthMap.Sample(gsamLinearWrap, pin.Uv).r;
 
     float3 normalW = DecodeOctahedron(normalTex);
-    float3 posW = ReconstructWorldPos(pin.Uv, depthNdc);
+    float3 posV = ReconstructViewPos(pin.Uv, depthNdc);
+    float3 posW = ReconstructWorldPos(posV);
 
     if (gDebugView == 1)
         return float4(albedo.rgb, 1.0f);
@@ -362,7 +459,8 @@ float4 LightingPS(FSOut pin) : SV_Target
     [loop]
     for (uint dirIndex = 0; dirIndex < gDirectionalLightCount; ++dirIndex)
     {
-        result += EvaluateDirectionalLight(albedo.rgb, normalW, gDirectionalLights[dirIndex]);
+        float shadowFactor = (dirIndex == 0) ? SampleShadowFactor(posW, posV.z) : 1.0f;
+        result += EvaluateDirectionalLight(albedo.rgb, normalW, gDirectionalLights[dirIndex]) * shadowFactor;
     }
 
     [loop]

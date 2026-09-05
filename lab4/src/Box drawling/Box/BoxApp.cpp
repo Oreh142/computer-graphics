@@ -36,6 +36,14 @@ namespace
     constexpr UINT kInvalidIndex = (std::numeric_limits<UINT>::max)();
     constexpr float kTreeBillboardDistance = 30.0f;
     constexpr float kTreeBillboardDistanceSq = kTreeBillboardDistance * kTreeBillboardDistance;
+    constexpr UINT kShadowCascadeCount = 3;
+    constexpr UINT kShadowMapSize = 1024;
+    constexpr float kShadowNearZ = 1.0f;
+    constexpr float kShadowMaxDistance = 80.0f;
+    constexpr float kShadowSplitLambda = 0.75f;
+    constexpr float kShadowDepthPadding = 60.0f;
+    constexpr float kShadowReceiverBias = 0.0015f;
+    constexpr UINT kShadowQualityMedium = 1;
 }
 
 struct Vertex
@@ -59,6 +67,15 @@ struct ObjectConstants
     float TessMaxDistance = 18.0f;
     float TessMinFactor = 1.0f;
     float TessMaxFactor = 12.0f;
+};
+
+struct ShadowObjectConstants
+{
+    XMFLOAT4X4 World = MathHelper::Identity4x4();
+    XMFLOAT4X4 ViewProj = MathHelper::Identity4x4();
+    XMFLOAT2 UvScale = XMFLOAT2(1.0f, 1.0f);
+    XMFLOAT2 UvOffset = XMFLOAT2(0.0f, 0.0f);
+    XMFLOAT4 Tint = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
 };
 
 struct TgaImage
@@ -309,12 +326,17 @@ private:
     void BuildDescriptorHeaps();
     void BuildDeferredSrvHeap();
     void UpdateDeferredSrvDescriptors();
+    void BuildShadowResources();
     void BuildConstantBuffers();
     void BuildRootSignatures();
     void BuildShadersAndInputLayout();
     void BuildBoxGeometry();
     void BuildPSOs();
     void BuildLights();
+    void BuildShadowCasterList();
+    void UpdateShadowCascades();
+    void DrawShadowPass();
+    D3D12_CPU_DESCRIPTOR_HANDLE ShadowDsv(UINT cascadeIndex) const;
     UINT CreateRgbaTexture(const std::string& name, UINT width, UINT height, const std::vector<std::uint8_t>& rgba);
     UINT CreateSolidColorTexture(const std::string& name, const std::array<std::uint8_t, 4>& rgba);
     UINT LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName);
@@ -364,16 +386,21 @@ private:
 
     ComPtr<ID3D12RootSignature> mGeometryRootSignature = nullptr;
     ComPtr<ID3D12RootSignature> mLightingRootSignature = nullptr;
+    ComPtr<ID3D12RootSignature> mShadowRootSignature = nullptr;
     ComPtr<ID3D12DescriptorHeap> mCbvSrvHeap = nullptr;
     ComPtr<ID3D12DescriptorHeap> mDeferredSrvHeap = nullptr;
+    ComPtr<ID3D12DescriptorHeap> mShadowDsvHeap = nullptr;
+    ComPtr<ID3D12Resource> mShadowMap = nullptr;
 
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB = nullptr;
+    std::unique_ptr<UploadBuffer<ShadowObjectConstants>> mShadowCB = nullptr;
     std::unique_ptr<UploadBuffer<DeferredPassConstants>> mDeferredCB = nullptr;
     DeferredRenderer mDeferredRenderer;
 
     std::unique_ptr<MeshGeometry> mBoxGeo = nullptr;
     std::vector<DrawBatch> mDrawBatches;
     std::vector<UINT> mVisibleBatchIndices;
+    std::vector<UINT> mShadowCasterBatchIndices;
     std::vector<CullObject> mForestObjects;
     std::unique_ptr<OctreeNode> mForestOctreeRoot = nullptr;
     std::vector<std::unique_ptr<Texture>> mTextures;
@@ -384,6 +411,8 @@ private:
     ComPtr<ID3DBlob> mGBufferTessVS = nullptr;
     ComPtr<ID3DBlob> mGBufferHS = nullptr;
     ComPtr<ID3DBlob> mGBufferDS = nullptr;
+    ComPtr<ID3DBlob> mShadowVS = nullptr;
+    ComPtr<ID3DBlob> mShadowPS = nullptr;
     ComPtr<ID3DBlob> mLightingVS = nullptr;
     ComPtr<ID3DBlob> mLightingPS = nullptr;
     ComPtr<ID3DBlob> mDebugWirePS = nullptr;
@@ -393,8 +422,21 @@ private:
     ComPtr<ID3D12PipelineState> mGBufferPSO = nullptr;
     ComPtr<ID3D12PipelineState> mGBufferBillboardPSO = nullptr;
     ComPtr<ID3D12PipelineState> mGBufferTessPSO = nullptr;
+    ComPtr<ID3D12PipelineState> mShadowOpaquePSO = nullptr;
+    ComPtr<ID3D12PipelineState> mShadowAlphaTestPSO = nullptr;
     ComPtr<ID3D12PipelineState> mLightingPSO = nullptr;
     ComPtr<ID3D12PipelineState> mTessWirePSO = nullptr;
+
+    D3D12_VIEWPORT mShadowViewport = {};
+    D3D12_RECT mShadowScissorRect = {};
+    std::array<XMFLOAT4X4, kShadowCascadeCount> mShadowTransforms =
+    {
+        MathHelper::Identity4x4(),
+        MathHelper::Identity4x4(),
+        MathHelper::Identity4x4()
+    };
+    XMFLOAT4 mCascadeSplits = XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
+    bool mShadowsEnabled = true;
 
     FreeCamera mCamera;
     float mMoveSpeed = 10.0f;
@@ -469,6 +511,7 @@ bool BoxApp::Initialize()
     BuildConstantBuffers();
     BuildDescriptorHeaps();
     BuildDeferredSrvHeap();
+    BuildShadowResources();
     BuildRootSignatures();
     BuildPSOs();
     mDeferredRenderer.Buffers.Build(md3dDevice.Get(), mClientWidth, mClientHeight);
@@ -600,6 +643,110 @@ void BoxApp::AddVisibleTreeObject(UINT objectIndex, const XMFLOAT3& cameraPos, s
         ++visibleMeshObjects;
 }
 
+void BoxApp::UpdateShadowCascades()
+{
+    mShadowsEnabled = (mActiveScene == kSceneSponza) &&
+        !mDeferredRenderer.Lighting.DirectionalLights.empty() &&
+        !mShadowCasterBatchIndices.empty();
+    if (!mShadowsEnabled)
+    {
+        mCascadeSplits = XMFLOAT4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (auto& transform : mShadowTransforms)
+            transform = MathHelper::Identity4x4();
+        return;
+    }
+
+    const XMMATRIX invView = XMMatrixInverse(nullptr, mCamera.GetView());
+    const float aspect = AspectRatio();
+    const float tanHalfFovY = std::tan(0.125f * MathHelper::Pi);
+    const float nearZ = kShadowNearZ;
+    const float farZ = kShadowMaxDistance;
+
+    XMVECTOR lightDir = XMLoadFloat3(&mDeferredRenderer.Lighting.DirectionalLights[0].Direction);
+    lightDir = XMVector3Normalize(lightDir);
+    XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    if (std::fabs(XMVectorGetX(XMVector3Dot(lightDir, lightUp))) > 0.95f)
+        lightUp = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+
+    std::array<float, kShadowCascadeCount> splitDepths = {};
+    float cascadeNear = nearZ;
+
+    for (UINT cascadeIndex = 0; cascadeIndex < kShadowCascadeCount; ++cascadeIndex)
+    {
+        const float p = static_cast<float>(cascadeIndex + 1) / static_cast<float>(kShadowCascadeCount);
+        const float logSplit = nearZ * std::pow(farZ / nearZ, p);
+        const float uniformSplit = nearZ + (farZ - nearZ) * p;
+        const float cascadeFar = kShadowSplitLambda * logSplit + (1.0f - kShadowSplitLambda) * uniformSplit;
+        splitDepths[cascadeIndex] = cascadeFar;
+
+        std::array<XMVECTOR, 8> corners = {};
+        UINT cornerIndex = 0;
+        for (float z : { cascadeNear, cascadeFar })
+        {
+            const float halfY = z * tanHalfFovY;
+            const float halfX = halfY * aspect;
+            corners[cornerIndex++] = XMVector3TransformCoord(XMVectorSet(-halfX, -halfY, z, 1.0f), invView);
+            corners[cornerIndex++] = XMVector3TransformCoord(XMVectorSet(-halfX, halfY, z, 1.0f), invView);
+            corners[cornerIndex++] = XMVector3TransformCoord(XMVectorSet(halfX, halfY, z, 1.0f), invView);
+            corners[cornerIndex++] = XMVector3TransformCoord(XMVectorSet(halfX, -halfY, z, 1.0f), invView);
+        }
+
+        XMVECTOR center = XMVectorZero();
+        for (const XMVECTOR& corner : corners)
+            center += corner;
+        center /= static_cast<float>(corners.size());
+
+        const XMMATRIX lightView = XMMatrixLookAtLH(center - lightDir * kShadowMaxDistance, center, lightUp);
+
+        XMFLOAT3 minPoint(
+            (std::numeric_limits<float>::max)(),
+            (std::numeric_limits<float>::max)(),
+            (std::numeric_limits<float>::max)());
+        XMFLOAT3 maxPoint(
+            -(std::numeric_limits<float>::max)(),
+            -(std::numeric_limits<float>::max)(),
+            -(std::numeric_limits<float>::max)());
+
+        for (const XMVECTOR& corner : corners)
+        {
+            XMFLOAT3 pLight;
+            XMStoreFloat3(&pLight, XMVector3TransformCoord(corner, lightView));
+            minPoint.x = (std::min)(minPoint.x, pLight.x);
+            minPoint.y = (std::min)(minPoint.y, pLight.y);
+            minPoint.z = (std::min)(minPoint.z, pLight.z);
+            maxPoint.x = (std::max)(maxPoint.x, pLight.x);
+            maxPoint.y = (std::max)(maxPoint.y, pLight.y);
+            maxPoint.z = (std::max)(maxPoint.z, pLight.z);
+        }
+
+        minPoint.z -= kShadowDepthPadding;
+        maxPoint.z += kShadowDepthPadding;
+
+        const float texelSizeX = (maxPoint.x - minPoint.x) / static_cast<float>(kShadowMapSize);
+        const float texelSizeY = (maxPoint.y - minPoint.y) / static_cast<float>(kShadowMapSize);
+        if (texelSizeX > 0.0f)
+        {
+            minPoint.x = std::floor(minPoint.x / texelSizeX) * texelSizeX;
+            maxPoint.x = std::ceil(maxPoint.x / texelSizeX) * texelSizeX;
+        }
+        if (texelSizeY > 0.0f)
+        {
+            minPoint.y = std::floor(minPoint.y / texelSizeY) * texelSizeY;
+            maxPoint.y = std::ceil(maxPoint.y / texelSizeY) * texelSizeY;
+        }
+
+        const XMMATRIX lightProj = XMMatrixOrthographicOffCenterLH(
+            minPoint.x, maxPoint.x,
+            minPoint.y, maxPoint.y,
+            minPoint.z, maxPoint.z);
+
+        XMStoreFloat4x4(&mShadowTransforms[cascadeIndex], XMMatrixTranspose(lightView * lightProj));
+        cascadeNear = cascadeFar;
+    }
+
+    mCascadeSplits = XMFLOAT4(splitDepths[0], splitDepths[1], splitDepths[2], 0.0f);
+}
+
 std::wstring BoxApp::GetAdditionalWindowText() const
 {
     const XMFLOAT3 cameraPos = mCamera.GetPosition3f();
@@ -714,6 +861,8 @@ void BoxApp::Update(const GameTimer& gt)
             XMMatrixTranslation(batch.BillboardBase.x, batch.BillboardBase.y, batch.BillboardBase.z));
     }
 
+    UpdateShadowCascades();
+
     for (size_t i = 0; i < mDrawBatches.size(); ++i)
     {
         const DrawBatch& batch = mDrawBatches[i];
@@ -734,6 +883,26 @@ void BoxApp::Update(const GameTimer& gt)
         mObjectCB->CopyData(static_cast<int>(i), objConstants);
     }
 
+    const UINT shadowCasterCount = mShadowsEnabled ? static_cast<UINT>(mShadowCasterBatchIndices.size()) : 0u;
+    for (UINT cascadeIndex = 0; cascadeIndex < kShadowCascadeCount; ++cascadeIndex)
+    {
+        for (UINT casterIndex = 0; casterIndex < shadowCasterCount; ++casterIndex)
+        {
+            const UINT batchIndex = mShadowCasterBatchIndices[casterIndex];
+            const DrawBatch& batch = mDrawBatches[batchIndex];
+
+            ShadowObjectConstants shadowConstants;
+            const XMMATRIX world = XMLoadFloat4x4(&batch.World);
+            XMStoreFloat4x4(&shadowConstants.World, XMMatrixTranspose(world));
+            shadowConstants.ViewProj = mShadowTransforms[cascadeIndex];
+            shadowConstants.UvScale = batch.UvScale;
+            shadowConstants.UvOffset = batch.AnimateUv ? mAnimatedUvOffset : XMFLOAT2(0.0f, 0.0f);
+            shadowConstants.Tint = batch.Tint;
+
+            mShadowCB->CopyData(static_cast<int>(cascadeIndex * shadowCasterCount + casterIndex), shadowConstants);
+        }
+    }
+
     DeferredPassConstants pass = {};
     const XMMATRIX invView = XMMatrixInverse(nullptr, view);
     const XMMATRIX invProj = XMMatrixInverse(nullptr, proj);
@@ -745,6 +914,14 @@ void BoxApp::Update(const GameTimer& gt)
     pass.SpotLightCount = static_cast<UINT>(std::min<size_t>(mDeferredRenderer.Lighting.SpotLights.size(), 8));
     pass.DebugView = mDebugView;
     pass.Ambient = (mActiveScene == kSceneForest) ? 0.12f : 0.001f;
+    for (UINT i = 0; i < kShadowCascadeCount; ++i)
+        pass.ShadowTransforms[i] = mShadowTransforms[i];
+    pass.CascadeSplits = mCascadeSplits;
+    pass.ShadowTexelSize = XMFLOAT2(1.0f / static_cast<float>(kShadowMapSize), 1.0f / static_cast<float>(kShadowMapSize));
+    pass.ShadowBias = kShadowReceiverBias;
+    pass.ShadowCascadeCount = mShadowsEnabled ? kShadowCascadeCount : 0u;
+    pass.ShadowQuality = kShadowQualityMedium;
+    pass.ShadowsEnabled = mShadowsEnabled ? 1u : 0u;
 
     for (UINT i = 0; i < pass.PointLightCount; ++i)
         pass.PointLights[i] = mDeferredRenderer.Lighting.PointLights[i];
@@ -756,6 +933,50 @@ void BoxApp::Update(const GameTimer& gt)
     mDeferredCB->CopyData(0, pass);
 }
 
+void BoxApp::DrawShadowPass()
+{
+    if (mActiveScene != kSceneSponza || !mShadowsEnabled || !mShadowMap || mShadowCasterBatchIndices.empty())
+        return;
+
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mShadowMap.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE));
+
+    ID3D12DescriptorHeap* shadowHeaps[] = { mCbvSrvHeap.Get() };
+    mCommandList->SetDescriptorHeaps(_countof(shadowHeaps), shadowHeaps);
+    mCommandList->SetGraphicsRootSignature(mShadowRootSignature.Get());
+    mCommandList->SetGraphicsRootDescriptorTable(1, mCbvSrvHeap->GetGPUDescriptorHandleForHeapStart());
+    mCommandList->RSSetViewports(1, &mShadowViewport);
+    mCommandList->RSSetScissorRects(1, &mShadowScissorRect);
+    mCommandList->IASetVertexBuffers(0, 1, &mBoxGeo->VertexBufferView());
+    mCommandList->IASetIndexBuffer(&mBoxGeo->IndexBufferView());
+    mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    const UINT shadowCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ShadowObjectConstants));
+    const UINT shadowCasterCount = static_cast<UINT>(mShadowCasterBatchIndices.size());
+    const D3D12_GPU_VIRTUAL_ADDRESS shadowCbAddress = mShadowCB->Resource()->GetGPUVirtualAddress();
+    mCommandList->SetPipelineState(mShadowOpaquePSO.Get());
+
+    for (UINT cascadeIndex = 0; cascadeIndex < kShadowCascadeCount; ++cascadeIndex)
+    {
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = ShadowDsv(cascadeIndex);
+        mCommandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+        mCommandList->OMSetRenderTargets(0, nullptr, false, &dsv);
+
+        for (UINT casterIndex = 0; casterIndex < shadowCasterCount; ++casterIndex)
+        {
+            const UINT batchIndex = mShadowCasterBatchIndices[casterIndex];
+            const DrawBatch& batch = mDrawBatches[batchIndex];
+
+            const UINT shadowCBIndex = cascadeIndex * shadowCasterCount + casterIndex;
+            mCommandList->SetGraphicsRootConstantBufferView(0, shadowCbAddress + static_cast<UINT64>(shadowCBIndex) * shadowCBByteSize);
+            mCommandList->DrawIndexedInstanced(batch.IndexCount, 1, batch.StartIndexLocation, 0, 0);
+        }
+    }
+
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mShadowMap.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+}
+
 void BoxApp::Draw(const GameTimer& gt)
 {
     ThrowIfFailed(mDirectCmdListAlloc->Reset());
@@ -765,6 +986,8 @@ void BoxApp::Draw(const GameTimer& gt)
     auto* depth = mDepthStencilBuffer.Get();
 
     ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), mGBufferPSO.Get()));
+    DrawShadowPass();
+
     mCommandList->RSSetViewports(1, &mScreenViewport);
     mCommandList->RSSetScissorRects(1, &mScissorRect);
 
@@ -1250,7 +1473,7 @@ void BoxApp::BuildDescriptorHeaps()
 void BoxApp::BuildDeferredSrvHeap()
 {
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 3;
+    heapDesc.NumDescriptors = 4;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     heapDesc.NodeMask = 0;
@@ -1286,12 +1509,90 @@ void BoxApp::UpdateDeferredSrvDescriptors()
     depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     depthSrv.Texture2D.MipLevels = 1;
     md3dDevice->CreateShaderResourceView(depth, &depthSrv, dstCpu);
+    dstCpu.ptr += descriptorSize;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC shadowSrv = {};
+    shadowSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    shadowSrv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    shadowSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    shadowSrv.Texture2DArray.MostDetailedMip = 0;
+    shadowSrv.Texture2DArray.MipLevels = 1;
+    shadowSrv.Texture2DArray.FirstArraySlice = 0;
+    shadowSrv.Texture2DArray.ArraySize = kShadowCascadeCount;
+    shadowSrv.Texture2DArray.ResourceMinLODClamp = 0.0f;
+    md3dDevice->CreateShaderResourceView(mShadowMap.Get(), &shadowSrv, dstCpu);
+}
+
+void BoxApp::BuildShadowResources()
+{
+    D3D12_RESOURCE_DESC shadowDesc = {};
+    shadowDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    shadowDesc.Alignment = 0;
+    shadowDesc.Width = kShadowMapSize;
+    shadowDesc.Height = kShadowMapSize;
+    shadowDesc.DepthOrArraySize = static_cast<UINT16>(kShadowCascadeCount);
+    shadowDesc.MipLevels = 1;
+    shadowDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    shadowDesc.SampleDesc.Count = 1;
+    shadowDesc.SampleDesc.Quality = 0;
+    shadowDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    shadowDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE clearValue = {};
+    clearValue.Format = mDepthStencilFormat;
+    clearValue.DepthStencil.Depth = 1.0f;
+    clearValue.DepthStencil.Stencil = 0;
+
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE,
+        &shadowDesc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        &clearValue,
+        IID_PPV_ARGS(mShadowMap.GetAddressOf())));
+
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+    dsvHeapDesc.NumDescriptors = kShadowCascadeCount;
+    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    dsvHeapDesc.NodeMask = 0;
+    ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(mShadowDsvHeap.GetAddressOf())));
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = mDepthStencilFormat;
+    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+    dsvDesc.Texture2DArray.MipSlice = 0;
+    dsvDesc.Texture2DArray.ArraySize = 1;
+
+    for (UINT cascadeIndex = 0; cascadeIndex < kShadowCascadeCount; ++cascadeIndex)
+    {
+        dsvDesc.Texture2DArray.FirstArraySlice = cascadeIndex;
+        md3dDevice->CreateDepthStencilView(mShadowMap.Get(), &dsvDesc, ShadowDsv(cascadeIndex));
+    }
+
+    mShadowViewport.TopLeftX = 0.0f;
+    mShadowViewport.TopLeftY = 0.0f;
+    mShadowViewport.Width = static_cast<float>(kShadowMapSize);
+    mShadowViewport.Height = static_cast<float>(kShadowMapSize);
+    mShadowViewport.MinDepth = 0.0f;
+    mShadowViewport.MaxDepth = 1.0f;
+    mShadowScissorRect = { 0, 0, static_cast<LONG>(kShadowMapSize), static_cast<LONG>(kShadowMapSize) };
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE BoxApp::ShadowDsv(UINT cascadeIndex) const
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = mShadowDsvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(cascadeIndex) * mDsvDescriptorSize;
+    return handle;
 }
 
 void BoxApp::BuildConstantBuffers()
 {
     const UINT objectCount = static_cast<UINT>(std::max<size_t>(1, mDrawBatches.size()));
+    const UINT shadowCasterCount = static_cast<UINT>(std::max<size_t>(1, mShadowCasterBatchIndices.size()));
     mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), objectCount, true);
+    mShadowCB = std::make_unique<UploadBuffer<ShadowObjectConstants>>(md3dDevice.Get(), shadowCasterCount * kShadowCascadeCount, true);
     mDeferredCB = std::make_unique<UploadBuffer<DeferredPassConstants>>(md3dDevice.Get(), 1, true);
 }
 
@@ -1328,14 +1629,47 @@ void BoxApp::BuildRootSignatures()
     ThrowIfFailed(md3dDevice->CreateRootSignature(0, serializedRootSig->GetBufferPointer(),
         serializedRootSig->GetBufferSize(), IID_PPV_ARGS(&mGeometryRootSignature)));
 
+    CD3DX12_DESCRIPTOR_RANGE shadowSrvTable;
+    shadowSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+
+    CD3DX12_ROOT_PARAMETER shadowRootParameter[2];
+    shadowRootParameter[0].InitAsConstantBufferView(0);
+    shadowRootParameter[1].InitAsDescriptorTable(1, &shadowSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+
+    CD3DX12_ROOT_SIGNATURE_DESC shadowRootSigDesc(2, shadowRootParameter, 1, &linearWrap,
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+    serializedRootSig.Reset();
+    errorBlob.Reset();
+    hr = D3D12SerializeRootSignature(&shadowRootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+        serializedRootSig.GetAddressOf(), errorBlob.GetAddressOf());
+    if (errorBlob != nullptr)
+        ::OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+    ThrowIfFailed(hr);
+
+    ThrowIfFailed(md3dDevice->CreateRootSignature(0, serializedRootSig->GetBufferPointer(),
+        serializedRootSig->GetBufferSize(), IID_PPV_ARGS(&mShadowRootSignature)));
+
     CD3DX12_DESCRIPTOR_RANGE lightSrvTable;
-    lightSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0);
+    lightSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0);
 
     CD3DX12_ROOT_PARAMETER lightRootParameter[2];
     lightRootParameter[0].InitAsDescriptorTable(1, &lightSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
     lightRootParameter[1].InitAsConstantBufferView(1);
 
-    CD3DX12_ROOT_SIGNATURE_DESC lightRootSigDesc(2, lightRootParameter, 1, &linearWrap,
+    CD3DX12_STATIC_SAMPLER_DESC lightSamplers[2] =
+    {
+        linearWrap,
+        CD3DX12_STATIC_SAMPLER_DESC(1,
+            D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
+            D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+            D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+            D3D12_TEXTURE_ADDRESS_MODE_BORDER)
+    };
+    lightSamplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    lightSamplers[1].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+
+    CD3DX12_ROOT_SIGNATURE_DESC lightRootSigDesc(2, lightRootParameter, _countof(lightSamplers), lightSamplers,
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
     serializedRootSig.Reset();
@@ -1357,6 +1691,8 @@ void BoxApp::BuildShadersAndInputLayout()
     mGBufferTessVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferTessVS", "vs_5_0");
     mGBufferHS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferHS", "hs_5_0");
     mGBufferDS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "GBufferDS", "ds_5_0");
+    mShadowVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "ShadowVS", "vs_5_0");
+    mShadowPS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "ShadowPS", "ps_5_0");
     mLightingVS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "LightingVS", "vs_5_0");
     mLightingPS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "LightingPS", "ps_5_0");
     mDebugWirePS = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "DebugTessWirePS", "ps_5_0");
@@ -1378,9 +1714,9 @@ void BoxApp::BuildLights()
 
     mDeferredRenderer.Lighting.DirectionalLights.push_back({ XMFLOAT3(0.35f, -1.0f, 0.25f), 0.45f, XMFLOAT3(1.0f, 0.96f, 0.9f), 0.0f });
 
-    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(-1.8f, 1.9f, -1.2f), 6.5f, XMFLOAT3(1.0f, 0.45f, 0.3f), 10.0f });
-    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(1.9f, 2.0f, -0.3f), 6.5f, XMFLOAT3(0.25f, 0.55f, 1.0f), 10.0f });
-    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(0.0f, 5.5f, 0.0f), 14.0f, XMFLOAT3(1.0f, 0.95f, 0.8f), 8.0f });
+    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(-1.8f, 1.9f, 1.2f), 6.5f, XMFLOAT3(1.0f, 0.45f, 0.3f), 10.0f });
+    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(1.9f, 2.0f, 1.3f), 6.5f, XMFLOAT3(0.25f, 0.55f, 1.0f), 10.0f });
+    mDeferredRenderer.Lighting.PointLights.push_back({ XMFLOAT3(0.0f, 5.5f, 2.0f), 14.0f, XMFLOAT3(1.0f, 0.95f, 0.8f), 8.0f });
 
     SpotLight spotlight;
     spotlight.Position = XMFLOAT3(0.0f, 4.5f, -2.5f);
@@ -1393,12 +1729,26 @@ void BoxApp::BuildLights()
     mDeferredRenderer.Lighting.SpotLights.push_back(spotlight);
 }
 
+void BoxApp::BuildShadowCasterList()
+{
+    mShadowCasterBatchIndices.clear();
+    mShadowCasterBatchIndices.reserve(mDrawBatches.size());
+
+    for (UINT batchIndex = 0; batchIndex < static_cast<UINT>(mDrawBatches.size()); ++batchIndex)
+    {
+        const DrawBatch& batch = mDrawBatches[batchIndex];
+        if (batch.SceneId == kSceneSponza && !batch.Billboard)
+            mShadowCasterBatchIndices.push_back(batchIndex);
+    }
+}
+
 void BoxApp::BuildBoxGeometry()
 {
     mTextures.clear();
     mTextureIndexByName.clear();
     mDrawBatches.clear();
     mVisibleBatchIndices.clear();
+    mShadowCasterBatchIndices.clear();
     mForestObjects.clear();
     mForestOctreeRoot.reset();
 
@@ -1780,6 +2130,7 @@ void BoxApp::BuildBoxGeometry()
     }
 
     BuildForestOctree();
+    BuildShadowCasterList();
 
     const UINT vbByteSize = static_cast<UINT>(vertices.size() * sizeof(Vertex));
     const UINT ibByteSize = static_cast<UINT>(indices.size() * sizeof(std::uint32_t));
@@ -1840,6 +2191,35 @@ void BoxApp::BuildPSOs()
     D3D12_GRAPHICS_PIPELINE_STATE_DESC billboardPsoDesc = gbufferPsoDesc;
     billboardPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&billboardPsoDesc, IID_PPV_ARGS(&mGBufferBillboardPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowPsoDesc = {};
+    shadowPsoDesc.InputLayout = { mInputLayout.data(), static_cast<UINT>(mInputLayout.size()) };
+    shadowPsoDesc.pRootSignature = mShadowRootSignature.Get();
+    shadowPsoDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(mShadowVS->GetBufferPointer()),
+        mShadowVS->GetBufferSize()
+    };
+    shadowPsoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    shadowPsoDesc.RasterizerState.DepthBias = 80000;
+    shadowPsoDesc.RasterizerState.SlopeScaledDepthBias = 1.5f;
+    shadowPsoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    shadowPsoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    shadowPsoDesc.SampleMask = UINT_MAX;
+    shadowPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    shadowPsoDesc.NumRenderTargets = 0;
+    shadowPsoDesc.SampleDesc.Count = 1;
+    shadowPsoDesc.SampleDesc.Quality = 0;
+    shadowPsoDesc.DSVFormat = mDepthStencilFormat;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&shadowPsoDesc, IID_PPV_ARGS(&mShadowOpaquePSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowAlphaPsoDesc = shadowPsoDesc;
+    shadowAlphaPsoDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(mShadowPS->GetBufferPointer()),
+        mShadowPS->GetBufferSize()
+    };
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&shadowAlphaPsoDesc, IID_PPV_ARGS(&mShadowAlphaTestPSO)));
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC gbufferTessPsoDesc = gbufferPsoDesc;
     gbufferTessPsoDesc.VS =
