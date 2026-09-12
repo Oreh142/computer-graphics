@@ -5,6 +5,7 @@
 class GBuffer
 {
 public:
+    static constexpr DXGI_FORMAT AlbedoFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
     bool IsInitialized() const;
 
     void Build(ID3D12Device* device, UINT width, UINT height);

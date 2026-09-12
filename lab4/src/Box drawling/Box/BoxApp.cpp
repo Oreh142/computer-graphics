@@ -9,6 +9,9 @@
 #include "tiny_obj_loader.h"
 #include "GBuffer.h"
 #include "RenderingSystem.h"
+#include "GpuParticleSystem.h"
+#include "PostProcessing.h"
+#include <d3d12sdklayers.h>
 
 #include <vector>
 #include <string>
@@ -298,6 +301,7 @@ public:
     ~BoxApp();
 
     virtual bool Initialize()override;
+    int RunParticleSmokeTest(bool postProcessTest = false);
 
 private:
     virtual void OnResize()override;
@@ -336,10 +340,11 @@ private:
     void BuildShadowCasterList();
     void UpdateShadowCascades();
     void DrawShadowPass();
+    void SavePostProcessFrame(const std::string& filename);
     D3D12_CPU_DESCRIPTOR_HANDLE ShadowDsv(UINT cascadeIndex) const;
-    UINT CreateRgbaTexture(const std::string& name, UINT width, UINT height, const std::vector<std::uint8_t>& rgba);
+    UINT CreateRgbaTexture(const std::string& name, UINT width, UINT height, const std::vector<std::uint8_t>& rgba, bool srgb = false);
     UINT CreateSolidColorTexture(const std::string& name, const std::array<std::uint8_t, 4>& rgba);
-    UINT LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName);
+    UINT LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName, bool srgb = false);
 
 private:
     struct DrawBatch
@@ -396,6 +401,16 @@ private:
     std::unique_ptr<UploadBuffer<ShadowObjectConstants>> mShadowCB = nullptr;
     std::unique_ptr<UploadBuffer<DeferredPassConstants>> mDeferredCB = nullptr;
     DeferredRenderer mDeferredRenderer;
+    GpuParticleSystem mParticles;
+    PostProcessing mPostProcessing;
+    PostProcessSettings mPostSettings;
+    bool mBloomKeyWasDown = false;
+    bool mVignetteKeyWasDown = false;
+    bool mParticlesPaused = false;
+    bool mParticlesPauseKeyWasDown = false;
+    bool mParticlesResetKeyWasDown = false;
+    bool mParticlesResetRequested = false;
+    float mParticleEmissionRemainder = 0.0f;
 
     std::unique_ptr<MeshGeometry> mBoxGeo = nullptr;
     std::vector<DrawBatch> mDrawBatches;
@@ -470,6 +485,8 @@ private:
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
     PSTR cmdLine, int showCmd)
 {
+    const bool postProcessTest = std::string(cmdLine) == "--postprocess-smoke-test";
+    const bool smokeTest = postProcessTest || std::string(cmdLine) == "--particle-smoke-test";
 #if defined(DEBUG) | defined(_DEBUG)
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif
@@ -478,15 +495,127 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
     {
         BoxApp theApp(hInstance);
         if (!theApp.Initialize())
-            return 0;
+            return smokeTest ? 1 : 0;
+
+        if (smokeTest)
+            return theApp.RunParticleSmokeTest(postProcessTest);
 
         return theApp.Run();
     }
     catch (DxException& e)
     {
+        if (smokeTest)
+        {
+            std::wofstream log(postProcessTest ? "x64/postprocess-smoke-test.txt" : "x64/particle-smoke-test.txt");
+            log << e.ToString();
+            return 1;
+        }
         MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK);
         return 0;
     }
+}
+
+int BoxApp::RunParticleSmokeTest(bool postProcessTest)
+{
+    std::ofstream log(postProcessTest ? "x64/postprocess-smoke-test.txt" : "x64/particle-smoke-test.txt");
+    ComPtr<ID3D12InfoQueue> info;
+    // Run the actual scene passes without an interactive message loop.
+    // The Debug build enables the D3D12 layer in D3DApp::Initialize.
+    if (FAILED(md3dDevice.As(&info)))
+    {
+        log << "Run the smoke test with the Debug build and Windows Graphics Tools installed.\n";
+        return 1;
+    }
+    GameTimer timer;
+    timer.Reset();
+    if (postProcessTest) mTextureAnimationEnabled = false;
+    for (UINT frame = 0; frame < 12; ++frame)
+    {
+        if (frame == 4) SetActiveScene(kSceneForest);
+        if (frame == 8) SetActiveScene(kSceneSponza);
+        mParticlesPaused = frame == 2 || frame == 3;
+        if (postProcessTest)
+        {
+            if (frame < 4) mParticlesPaused = true;
+            mPostSettings.Bloom = (frame & 1) != 0;
+            mPostSettings.Vignette = (frame & 2) != 0;
+            if (frame == 6 || frame == 8)
+            {
+                mClientWidth = frame == 6 ? 641 : 800;
+                mClientHeight = frame == 6 ? 359 : 600;
+                OnResize();
+            }
+        }
+        if (frame == 3) mParticlesResetRequested = true;
+        if (frame == 10) mDebugView = 4;
+        timer.Tick();
+        Update(timer);
+        Draw(timer);
+        if (postProcessTest && frame < 4)
+            SavePostProcessFrame("x64/postprocess-" + std::to_string(frame) + ".ppm");
+    }
+    bool failed = false;
+    for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i)
+    {
+        SIZE_T bytes = 0;
+        info->GetMessage(i, nullptr, &bytes);
+        std::vector<char> storage(bytes);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        ThrowIfFailed(info->GetMessage(i, message, &bytes));
+        if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR)
+        {
+            log << message->pDescription << '\n';
+            failed = true;
+        }
+    }
+    ThrowIfFailed(md3dDevice->GetDeviceRemovedReason());
+    if (!failed)
+    {
+        log << "PASS: Sponza, forest, pause, reset while paused, scene changes, tessellation overlay; "
+            << "no D3D12 validation errors.\n";
+        if (postProcessTest)
+            log << "PASS: all bloom/vignette combinations, window resize 641x359 and 800x600; screenshots saved.\n";
+    }
+    return failed ? 1 : 0;
+}
+
+void BoxApp::SavePostProcessFrame(const std::string& filename)
+{
+    // Test-only capture of our last presented back buffer, after the frame fence.
+    auto* frame = mSwapChainBuffer[(mCurrBackBuffer + SwapChainBufferCount - 1) % SwapChainBufferCount].Get();
+    const auto desc = frame->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    UINT64 bytes;
+    md3dDevice->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+    const auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+    const auto buffer = CD3DX12_RESOURCE_DESC::Buffer(bytes);
+    ComPtr<ID3D12Resource> readback;
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)));
+    ThrowIfFailed(mDirectCmdListAlloc->Reset());
+    ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
+    const auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(frame, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    mCommandList->ResourceBarrier(1, &toCopy);
+    const CD3DX12_TEXTURE_COPY_LOCATION source(frame, 0), target(readback.Get(), footprint);
+    mCommandList->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    const auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(frame, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    mCommandList->ResourceBarrier(1, &toPresent);
+    ThrowIfFailed(mCommandList->Close());
+    ID3D12CommandList* lists[] = { mCommandList.Get() };
+    mCommandQueue->ExecuteCommandLists(1, lists);
+    FlushCommandQueue();
+    void* mapped = nullptr;
+    const D3D12_RANGE range = { 0, static_cast<SIZE_T>(bytes) };
+    ThrowIfFailed(readback->Map(0, &range, &mapped));
+    std::ofstream image(filename, std::ios::binary);
+    image << "P6\n" << desc.Width << ' ' << desc.Height << "\n255\n";
+    for (UINT y = 0; y < desc.Height; ++y)
+    {
+        const auto* row = static_cast<const char*>(mapped) + footprint.Offset + y * footprint.Footprint.RowPitch;
+        for (UINT x = 0; x < desc.Width; ++x) image.write(row + x * 4, 3);
+    }
+    const D3D12_RANGE noWrite = { 0, 0 };
+    readback->Unmap(0, &noWrite);
 }
 
 BoxApp::BoxApp(HINSTANCE hInstance)
@@ -514,7 +643,11 @@ bool BoxApp::Initialize()
     BuildShadowResources();
     BuildRootSignatures();
     BuildPSOs();
+    mParticles.Initialize(md3dDevice.Get(), mCommandList.Get(), mDepthStencilFormat);
     mDeferredRenderer.Buffers.Build(md3dDevice.Get(), mClientWidth, mClientHeight);
+    mPostProcessing.Initialize(md3dDevice.Get());
+    mPostProcessing.Resize(md3dDevice.Get(), mClientWidth, mClientHeight,
+        mDeferredRenderer.Buffers.AlbedoResource(), mDeferredRenderer.Buffers.NormalResource(), mDepthStencilBuffer.Get());
     UpdateDeferredSrvDescriptors();
     BuildLights();
     mCamera.UpdateViewMatrix();
@@ -532,11 +665,25 @@ void BoxApp::OnResize()
 {
     D3DApp::OnResize();
 
+    // Keep the swap chain UNORM; encode linear output using sRGB RTVs only at presentation.
+    D3D12_RENDER_TARGET_VIEW_DESC displayView = {};
+    displayView.Format = PostProcessing::OutputFormat;
+    displayView.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    auto rtv = mRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < SwapChainBufferCount; ++i)
+    {
+        md3dDevice->CreateRenderTargetView(mSwapChainBuffer[i].Get(), &displayView, rtv);
+        rtv.ptr += mRtvDescriptorSize;
+    }
+
     mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
     if (mDeferredRenderer.Buffers.IsInitialized())
     {
         mDeferredRenderer.Buffers.Resize(md3dDevice.Get(), mClientWidth, mClientHeight);
         UpdateDeferredSrvDescriptors();
+        if (mPostProcessing.IsInitialized())
+            mPostProcessing.Resize(md3dDevice.Get(), mClientWidth, mClientHeight,
+                mDeferredRenderer.Buffers.AlbedoResource(), mDeferredRenderer.Buffers.NormalResource(), mDepthStencilBuffer.Get());
     }
 }
 
@@ -546,6 +693,7 @@ void BoxApp::SetActiveScene(UINT sceneId)
         return;
 
     mActiveScene = sceneId;
+    mParticlesResetRequested = true;
 
     if (mActiveScene == kSceneForest)
     {
@@ -772,6 +920,10 @@ std::wstring BoxApp::GetAdditionalWindowText() const
     stream << std::fixed << std::setprecision(2)
         << L"cam xyz: (" << cameraPos.x << L", " << cameraPos.y << L", " << cameraPos.z << L")"
         << L" | scene: " << kSceneNames[mActiveScene]
+        << L" | particles: " << (mParticlesPaused ? L"paused" : L"on") << L" [P pause, R reset]"
+        << L" | B bloom: " << (mPostSettings.Bloom ? L"on" : L"off")
+        << L" | V vignette: " << (mPostSettings.Vignette ? L"on" : L"off")
+        << L" | exposure: " << mPostSettings.Exposure
         << L" | debug: " << kDebugViewNames[mDebugView]
         << L" | tex anim: " << (mTextureAnimationEnabled ? L"on" : L"off")
         << L" | culling: " << cullingMode
@@ -813,6 +965,27 @@ void BoxApp::Update(const GameTimer& gt)
     if (debugKeyDown && !mDebugViewKeyWasDown)
         mDebugView = (mDebugView + 1) % 5;
     mDebugViewKeyWasDown = debugKeyDown;
+
+    const bool particlesPauseKeyDown = d3dUtil::IsKeyDown('P');
+    if (particlesPauseKeyDown && !mParticlesPauseKeyWasDown)
+        mParticlesPaused = !mParticlesPaused;
+    mParticlesPauseKeyWasDown = particlesPauseKeyDown;
+
+    const bool particlesResetKeyDown = d3dUtil::IsKeyDown('R');
+    if (particlesResetKeyDown && !mParticlesResetKeyWasDown)
+        mParticlesResetRequested = true;
+    mParticlesResetKeyWasDown = particlesResetKeyDown;
+
+    const bool bloomKeyDown = d3dUtil::IsKeyDown('B');
+    if (bloomKeyDown && !mBloomKeyWasDown) mPostSettings.Bloom = !mPostSettings.Bloom;
+    mBloomKeyWasDown = bloomKeyDown;
+    const bool vignetteKeyDown = d3dUtil::IsKeyDown('V');
+    if (vignetteKeyDown && !mVignetteKeyWasDown) mPostSettings.Vignette = !mPostSettings.Vignette;
+    mVignetteKeyWasDown = vignetteKeyDown;
+    if (d3dUtil::IsKeyDown(VK_OEM_PLUS) || d3dUtil::IsKeyDown(VK_ADD))
+        mPostSettings.Exposure = (std::min)(8.0f, mPostSettings.Exposure + dt);
+    if (d3dUtil::IsKeyDown(VK_OEM_MINUS) || d3dUtil::IsKeyDown(VK_SUBTRACT))
+        mPostSettings.Exposure = (std::max)(0.1f, mPostSettings.Exposure - dt);
 
     const bool textureAnimationKeyDown = d3dUtil::IsKeyDown('T');
     if (textureAnimationKeyDown && !mTextureAnimationKeyWasDown)
@@ -986,6 +1159,22 @@ void BoxApp::Draw(const GameTimer& gt)
     auto* depth = mDepthStencilBuffer.Get();
 
     ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), mGBufferPSO.Get()));
+    if (mParticlesResetRequested)
+    {
+        mParticles.Reset(mCommandList.Get());
+        mParticleEmissionRemainder = 0.0f;
+        mParticlesResetRequested = false;
+    }
+    if (!mParticlesPaused)
+    {
+        const float particleDt = (std::max)(0.0f, (std::min)(gt.DeltaTime(), 1.0f / 30.0f));
+        mParticleEmissionRemainder += 1200.0f * particleDt;
+        const UINT emitCount = static_cast<UINT>(mParticleEmissionRemainder);
+        mParticleEmissionRemainder -= static_cast<float>(emitCount);
+        const XMFLOAT3 emitter = (mActiveScene == kSceneForest)
+            ? XMFLOAT3(0.0f, 1.0f, -64.0f) : XMFLOAT3(0.0f, 0.7f, -2.5f);
+        mParticles.Simulate(mCommandList.Get(), particleDt, emitCount, emitter, 0.1f);
+    }
     DrawShadowPass();
 
     mCommandList->RSSetViewports(1, &mScreenViewport);
@@ -1047,6 +1236,8 @@ void BoxApp::Draw(const GameTimer& gt)
     drawBatches(false, true, mGBufferBillboardPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     drawBatches(true, false, mGBufferTessPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
 
+    mParticles.Draw(mCommandList.Get(), mCamera.GetView(), mCamera.GetProj());
+
     CD3DX12_RESOURCE_BARRIER toLighting[4] =
     {
         CD3DX12_RESOURCE_BARRIER::Transition(albedo, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
@@ -1059,8 +1250,7 @@ void BoxApp::Draw(const GameTimer& gt)
     mCommandList->SetPipelineState(mLightingPSO.Get());
     mCommandList->SetGraphicsRootSignature(mLightingRootSignature.Get());
     D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv = CurrentBackBufferView();
-    mCommandList->ClearRenderTargetView(backBufferRtv, Colors::Black, 0, nullptr);
-    mCommandList->OMSetRenderTargets(1, &backBufferRtv, true, nullptr);
+    mPostProcessing.BeginScene(mCommandList.Get());
 
     ID3D12DescriptorHeap* lightHeaps[] = { mDeferredSrvHeap.Get() };
     mCommandList->SetDescriptorHeaps(_countof(lightHeaps), lightHeaps);
@@ -1070,6 +1260,8 @@ void BoxApp::Draw(const GameTimer& gt)
     mCommandList->IASetIndexBuffer(nullptr);
     mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     mCommandList->DrawInstanced(3, 1, 0, 0);
+
+    mPostProcessing.Apply(mCommandList.Get(), backBufferRtv, mPostSettings, mDebugView);
 
     D3D12_RESOURCE_STATES depthStateBeforePresent = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     if (mDebugView == 4)
@@ -1153,7 +1345,7 @@ void BoxApp::OnMouseMove(WPARAM btnState, int x, int y)
     mLastMousePos.y = y;
 }
 
-UINT BoxApp::CreateRgbaTexture(const std::string& name, UINT width, UINT height, const std::vector<std::uint8_t>& rgba)
+UINT BoxApp::CreateRgbaTexture(const std::string& name, UINT width, UINT height, const std::vector<std::uint8_t>& rgba, bool srgb)
 {
     auto existing = mTextureIndexByName.find(name);
     if (existing != mTextureIndexByName.end())
@@ -1165,7 +1357,8 @@ UINT BoxApp::CreateRgbaTexture(const std::string& name, UINT width, UINT height,
     auto tex = std::make_unique<Texture>();
     tex->Name = name;
 
-    D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, width, height);
+    D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+        srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM, width, height);
     ThrowIfFailed(md3dDevice->CreateCommittedResource(
         &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
         D3D12_HEAP_FLAG_NONE,
@@ -1203,13 +1396,13 @@ UINT BoxApp::CreateSolidColorTexture(const std::string& name, const std::array<s
     return CreateRgbaTexture(name, 1, 1, std::vector<std::uint8_t>(rgba.begin(), rgba.end()));
 }
 
-UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName)
+UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std::string& texName, bool srgb)
 {
     if (texName.empty())
         return 0;
 
     const std::filesystem::path filePath = (baseDir / std::filesystem::path(texName)).lexically_normal();
-    const std::string cacheKey = filePath.generic_string();
+    const std::string cacheKey = filePath.generic_string() + (srgb ? "#srgb" : "#linear");
 
     auto it = mTextureIndexByName.find(cacheKey);
     if (it != mTextureIndexByName.end())
@@ -1232,7 +1425,7 @@ UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std
             mCommandList.Get(),
             tex->Filename.c_str(),
             tex->Resource,
-            tex->UploadHeap));
+            tex->UploadHeap, 0, nullptr, srgb));
 
         mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
             tex->Resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, shaderState));
@@ -1248,7 +1441,7 @@ UINT BoxApp::LoadOrCreateTexture(const std::filesystem::path& baseDir, const std
         texDesc.Height = static_cast<UINT>(img.Height);
         texDesc.DepthOrArraySize = 1;
         texDesc.MipLevels = 1;
-        texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDesc.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
         texDesc.SampleDesc.Count = 1;
         texDesc.SampleDesc.Quality = 0;
         texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -1492,7 +1685,7 @@ void BoxApp::UpdateDeferredSrvDescriptors()
 
     D3D12_SHADER_RESOURCE_VIEW_DESC albedoSrv = {};
     albedoSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    albedoSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    albedoSrv.Format = GBuffer::AlbedoFormat;
     albedoSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     albedoSrv.Texture2D.MipLevels = 1;
     md3dDevice->CreateShaderResourceView(albedo, &albedoSrv, dstCpu);
@@ -1869,7 +2062,7 @@ void BoxApp::BuildBoxGeometry()
                     {
                         const auto& material = materials[materialId];
                         if (!material.diffuse_texname.empty())
-                            bucket.Batch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, material.diffuse_texname);
+                            bucket.Batch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, material.diffuse_texname, true);
 
                         const std::string normalTexName = !material.normal_texname.empty() ? material.normal_texname :
                             (!material.bump_texname.empty() ? material.bump_texname : material.displacement_texname);
@@ -1961,7 +2154,7 @@ void BoxApp::BuildBoxGeometry()
         };
 
         DrawBatch plinthBatch;
-        plinthBatch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, "textures/spnza_bricks_a_diff.tga");
+        plinthBatch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, "textures/spnza_bricks_a_diff.tga", true);
         plinthBatch.NormalSrvIndex = LoadOrCreateTexture(texBase, "textures/spnza_bricks_a_ddn.tga");
         plinthBatch.DisplacementSrvIndex = LoadOrCreateTexture(texBase, "textures/spnza_bricks_a_ddn.tga");
         plinthBatch.Tessellated = true;
@@ -1971,7 +2164,7 @@ void BoxApp::BuildBoxGeometry()
         addGeneratedMesh(geoGen.CreateBox(1.5f, 1.6f, 1.5f, 0), plinthBatch);
 
         DrawBatch columnBatch;
-        columnBatch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, "textures/vase_dif.tga");
+        columnBatch.DiffuseSrvIndex = LoadOrCreateTexture(texBase, "textures/vase_dif.tga", true);
         columnBatch.NormalSrvIndex = LoadOrCreateTexture(texBase, "textures/vase_ddn.tga");
         columnBatch.DisplacementSrvIndex = LoadOrCreateTexture(texBase, "textures/vase_ddn.tga");
         columnBatch.Tessellated = true;
@@ -1981,7 +2174,7 @@ void BoxApp::BuildBoxGeometry()
         addGeneratedMesh(geoGen.CreateCylinder(0.55f, 0.85f, 2.4f, 24, 6), columnBatch);
 
         DrawBatch waterBatch;
-        waterBatch.DiffuseSrvIndex = LoadOrCreateTexture(texturesBase, "water1.dds");
+        waterBatch.DiffuseSrvIndex = LoadOrCreateTexture(texturesBase, "water1.dds", true);
         waterBatch.NormalSrvIndex = LoadOrCreateTexture(texturesBase, "default_nmap.dds");
         waterBatch.DisplacementSrvIndex = LoadOrCreateTexture(texturesBase, "water1.dds");
         waterBatch.Tessellated = true;
@@ -2002,7 +2195,7 @@ void BoxApp::BuildBoxGeometry()
 
         DrawBatch fieldBatch;
         fieldBatch.SceneId = kSceneForest;
-        fieldBatch.DiffuseSrvIndex = LoadOrCreateTexture(texturesBase, "grass.dds");
+        fieldBatch.DiffuseSrvIndex = LoadOrCreateTexture(texturesBase, "grass.dds", true);
         fieldBatch.NormalSrvIndex = LoadOrCreateTexture(texturesBase, "default_nmap.dds");
         fieldBatch.DisplacementSrvIndex = neutralDisplacementSrv;
         fieldBatch.UvScale = XMFLOAT2(kForestWidth * 0.2f, kForestDepth * 0.2f);
@@ -2014,8 +2207,8 @@ void BoxApp::BuildBoxGeometry()
             {
                 112, 73, 42, 255,
                 35, 115, 47, 255
-            });
-        const UINT treeBillboardSrv = LoadOrCreateTexture(texturesBase, "tree01S.dds");
+            }, true);
+        const UINT treeBillboardSrv = LoadOrCreateTexture(texturesBase, "tree01S.dds", true);
 
         std::vector<Vertex> treeVertices;
         std::vector<std::uint32_t> treeIndices;
@@ -2181,7 +2374,7 @@ void BoxApp::BuildPSOs()
     gbufferPsoDesc.SampleMask = UINT_MAX;
     gbufferPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     gbufferPsoDesc.NumRenderTargets = 2;
-    gbufferPsoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    gbufferPsoDesc.RTVFormats[0] = GBuffer::AlbedoFormat;
     gbufferPsoDesc.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
     gbufferPsoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
     gbufferPsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
@@ -2251,7 +2444,7 @@ void BoxApp::BuildPSOs()
     tessWirePsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     tessWirePsoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     tessWirePsoDesc.NumRenderTargets = 1;
-    tessWirePsoDesc.RTVFormats[0] = mBackBufferFormat;
+    tessWirePsoDesc.RTVFormats[0] = PostProcessing::OutputFormat;
     tessWirePsoDesc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&tessWirePsoDesc, IID_PPV_ARGS(&mTessWirePSO)));
 
@@ -2276,7 +2469,7 @@ void BoxApp::BuildPSOs()
     lightPsoDesc.SampleMask = UINT_MAX;
     lightPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     lightPsoDesc.NumRenderTargets = 1;
-    lightPsoDesc.RTVFormats[0] = mBackBufferFormat;
+    lightPsoDesc.RTVFormats[0] = PostProcessing::HdrFormat;
     lightPsoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
     lightPsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
     lightPsoDesc.DSVFormat = mDepthStencilFormat;

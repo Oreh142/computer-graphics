@@ -89,7 +89,8 @@ namespace DirectX
 		                               _Out_ Microsoft::WRL::ComPtr<ID3D12Resource>& texture,
 		                               _Out_ Microsoft::WRL::ComPtr<ID3D12Resource>& textureUploadHeap,
 		                               _In_ size_t maxsize = 0,
-		                               _Out_opt_ DDS_ALPHA_MODE* alphaMode = nullptr
+		                               _Out_opt_ DDS_ALPHA_MODE* alphaMode = nullptr,
+		                               _In_ bool forceSRGB = false
 		                               );
 
     // Standard version with optional auto-gen mipmap support

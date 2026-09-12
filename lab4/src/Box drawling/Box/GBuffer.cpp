@@ -73,14 +73,14 @@ D3D12_CPU_DESCRIPTOR_HANDLE GBuffer::NormalRtv() const
 
 void GBuffer::CreateTextures(ID3D12Device* device)
 {
-    auto albedoDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, mWidth, mHeight, 1, 1);
+    auto albedoDesc = CD3DX12_RESOURCE_DESC::Tex2D(AlbedoFormat, mWidth, mHeight, 1, 1);
     auto normalDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16_FLOAT, mWidth, mHeight, 1, 1);
     albedoDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     normalDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
     const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     D3D12_CLEAR_VALUE albedoClear = {};
-    albedoClear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    albedoClear.Format = AlbedoFormat;
     std::copy(std::begin(black), std::end(black), std::begin(albedoClear.Color));
 
     D3D12_CLEAR_VALUE normalClear = {};
@@ -124,7 +124,7 @@ void GBuffer::CreateViews(ID3D12Device* device)
     UINT srvSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_SHADER_RESOURCE_VIEW_DESC albedoSrv = {};
     albedoSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    albedoSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    albedoSrv.Format = AlbedoFormat;
     albedoSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     albedoSrv.Texture2D.MipLevels = 1;
 
