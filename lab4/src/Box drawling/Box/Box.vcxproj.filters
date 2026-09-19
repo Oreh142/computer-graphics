@@ -42,12 +42,15 @@
     <ClCompile Include="GBuffer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="GpuParticleSystem.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PostProcessing.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\Common\FreeCamera.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\..\Common\GeometryGenerator.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\..\Common\d3dApp.h">
@@ -71,5 +74,19 @@
     <ClInclude Include="RenderingSystem.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="GpuParticleSystem.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PostProcessing.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Shaders\particles.hlsl">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="Shaders\postprocess.hlsl">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

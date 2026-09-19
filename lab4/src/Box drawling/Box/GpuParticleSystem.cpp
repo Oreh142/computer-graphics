@@ -6,6 +6,18 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
+    DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT depthFormat)
+    {
+        switch (depthFormat)
+        {
+        case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        default: throw std::runtime_error("Unsupported particle collision depth format");
+        }
+    }
+
     void Transition(ID3D12GraphicsCommandList* commands, ID3D12Resource* resource,
         D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
     {
@@ -44,6 +56,7 @@ namespace
 void GpuParticleSystem::Initialize(ID3D12Device* device,
     ID3D12GraphicsCommandList* commands, DXGI_FORMAT depthFormat)
 {
+    mDepthSrvFormat = DepthSrvFormat(depthFormat);
     mResetUpload = Buffer(device, commands, sizeof(D3D12_DRAW_ARGUMENTS), D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
     const D3D12_DRAW_ARGUMENTS emptyDraw = { 0, 1, 0, 0 };
@@ -55,10 +68,20 @@ void GpuParticleSystem::Initialize(ID3D12Device* device,
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heapDesc.NumDescriptors = 2;
+    // Two append/consume UAVs and one SRV for screen-space depth collision.
+    heapDesc.NumDescriptors = 3;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mUavHeap)));
     mDescriptorSize = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC nullDepthSrv = {};
+    nullDepthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    nullDepthSrv.Format = mDepthSrvFormat;
+    nullDepthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    nullDepthSrv.Texture2D.MipLevels = 1;
+    auto depthHandle = mUavHeap->GetCPUDescriptorHandleForHeapStart();
+    depthHandle.ptr += static_cast<SIZE_T>(2) * mDescriptorSize;
+    device->CreateShaderResourceView(nullptr, &nullDepthSrv, depthHandle);
 
     for (UINT i = 0; i < 2; ++i)
     {
@@ -87,15 +110,17 @@ void GpuParticleSystem::Initialize(ID3D12Device* device,
     Transition(commands, mDrawArguments.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
 
-    CD3DX12_DESCRIPTOR_RANGE inputRange, outputRange;
+    CD3DX12_DESCRIPTOR_RANGE inputRange, outputRange, depthRange;
     inputRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
     outputRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1);
-    CD3DX12_ROOT_PARAMETER computeParams[4];
-    computeParams[0].InitAsConstants(12, 0);
+    depthRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);
+    CD3DX12_ROOT_PARAMETER computeParams[5];
+    computeParams[0].InitAsConstants(52, 0);
     computeParams[1].InitAsDescriptorTable(1, &inputRange);
     computeParams[2].InitAsDescriptorTable(1, &outputRange);
     computeParams[3].InitAsShaderResourceView(1);
-    mComputeRoot = RootSignature(device, CD3DX12_ROOT_SIGNATURE_DESC(4, computeParams));
+    computeParams[4].InitAsDescriptorTable(1, &depthRange);
+    mComputeRoot = RootSignature(device, CD3DX12_ROOT_SIGNATURE_DESC(5, computeParams));
 
     CD3DX12_ROOT_PARAMETER graphicsParams[2];
     graphicsParams[0].InitAsConstants(24, 1);
@@ -141,10 +166,31 @@ void GpuParticleSystem::Initialize(ID3D12Device* device,
     ThrowIfFailed(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&mDrawSignature)));
 }
 
+void GpuParticleSystem::SetCollisionDepth(ID3D12Device* device, ID3D12Resource* depthBuffer)
+{
+    assert(device && depthBuffer && mUavHeap);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = mDepthSrvFormat;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MostDetailedMip = 0;
+    srv.Texture2D.MipLevels = 1;
+    auto handle = mUavHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(2) * mDescriptorSize;
+    device->CreateShaderResourceView(depthBuffer, &srv, handle);
+}
+
 D3D12_GPU_DESCRIPTOR_HANDLE GpuParticleSystem::Uav(UINT bufferIndex) const
 {
     auto handle = mUavHeap->GetGPUDescriptorHandleForHeapStart();
     handle.ptr += static_cast<UINT64>(bufferIndex) * mDescriptorSize;
+    return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE GpuParticleSystem::DepthSrv() const
+{
+    auto handle = mUavHeap->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<UINT64>(2) * mDescriptorSize;
     return handle;
 }
 
@@ -191,6 +237,30 @@ void GpuParticleSystem::Reset(ID3D12GraphicsCommandList* commands)
 void GpuParticleSystem::Simulate(ID3D12GraphicsCommandList* commands, float deltaTime,
     UINT emitCount, const XMFLOAT3& emitter, float floorY)
 {
+    const XMMATRIX identity = XMMatrixIdentity();
+    SimulateInternal(commands, deltaTime, emitCount, emitter, floorY, false,
+        identity, identity, XMFLOAT3(0.0f, 0.0f, 0.0f), 1, 1);
+}
+
+void GpuParticleSystem::SimulateWithDepth(ID3D12GraphicsCommandList* commands, float deltaTime,
+    UINT emitCount, const XMFLOAT3& emitter, float floorY, ID3D12Resource* depthBuffer,
+    FXMMATRIX view, CXMMATRIX projection, const XMFLOAT3& cameraPosition,
+    UINT depthWidth, UINT depthHeight)
+{
+    assert(depthBuffer && depthWidth > 0 && depthHeight > 0);
+    Transition(commands, depthBuffer, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    SimulateInternal(commands, deltaTime, emitCount, emitter, floorY, true,
+        view, projection, cameraPosition, depthWidth, depthHeight);
+    Transition(commands, depthBuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE);
+}
+
+void GpuParticleSystem::SimulateInternal(ID3D12GraphicsCommandList* commands, float deltaTime,
+    UINT emitCount, const XMFLOAT3& emitter, float floorY, bool depthCollision,
+    FXMMATRIX view, CXMMATRIX projection, const XMFLOAT3& cameraPosition,
+    UINT depthWidth, UINT depthHeight)
+{
     const UINT output = 1 - mActive;
     MakeWritable(commands, mActive);
     MakeWritable(commands, output);
@@ -209,21 +279,40 @@ void GpuParticleSystem::Simulate(ID3D12GraphicsCommandList* commands, float delt
         float FloorY;
         XMFLOAT3 Acceleration;
         float Padding;
+        XMFLOAT4X4 ViewProjection;
+        XMFLOAT4X4 InverseViewProjection;
+        XMFLOAT3 CameraPosition;
+        float CollisionThickness;
+        XMUINT2 DepthDimensions;
+        UINT CollisionEnabled;
+        float Restitution;
     };
-    const SimulationConstants constants =
-    {
-        (std::max)(0.0f, (std::min)(deltaTime, 1.0f / 30.0f)),
-        (std::min)(emitCount, Capacity), ++mSeed, Capacity,
-        emitter, floorY, XMFLOAT3(0.25f, -4.0f, 0.0f), 0.0f
-    };
-    static_assert(sizeof(constants) == 48, "Simulation constants must match HLSL.");
+    SimulationConstants constants = {};
+    constants.DeltaTime = (std::max)(0.0f, (std::min)(deltaTime, 1.0f / 30.0f));
+    constants.EmitCount = (std::min)(emitCount, Capacity);
+    constants.Seed = ++mSeed;
+    constants.MaxParticles = Capacity;
+    constants.Emitter = emitter;
+    constants.FloorY = floorY;
+    constants.Acceleration = XMFLOAT3(0.25f, -4.0f, 0.0f);
+    const XMMATRIX viewProjection = view * projection;
+    XMStoreFloat4x4(&constants.ViewProjection, XMMatrixTranspose(viewProjection));
+    XMStoreFloat4x4(&constants.InverseViewProjection,
+        XMMatrixTranspose(XMMatrixInverse(nullptr, viewProjection)));
+    constants.CameraPosition = cameraPosition;
+    constants.CollisionThickness = 0.01f;
+    constants.DepthDimensions = XMUINT2(depthWidth, depthHeight);
+    constants.CollisionEnabled = depthCollision ? 1u : 0u;
+    constants.Restitution = 0.55f;
+    static_assert(sizeof(constants) == 208, "Simulation constants must match HLSL.");
     ID3D12DescriptorHeap* heaps[] = { mUavHeap.Get() };
     commands->SetDescriptorHeaps(1, heaps);
     commands->SetComputeRootSignature(mComputeRoot.Get());
-    commands->SetComputeRoot32BitConstants(0, 12, &constants, 0);
+    commands->SetComputeRoot32BitConstants(0, 52, &constants, 0);
     commands->SetComputeRootDescriptorTable(1, Uav(mActive));
     commands->SetComputeRootDescriptorTable(2, Uav(output));
     commands->SetComputeRootShaderResourceView(3, mCountSnapshot->GetGPUVirtualAddress());
+    commands->SetComputeRootDescriptorTable(4, DepthSrv());
     commands->SetPipelineState(mSimulatePso.Get());
     commands->Dispatch((Capacity + 255) / 256, 1, 1);
     auto uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(nullptr);

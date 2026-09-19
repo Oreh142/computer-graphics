@@ -21,9 +21,15 @@ public:
 
     void Initialize(ID3D12Device* device, ID3D12GraphicsCommandList* commands,
         DXGI_FORMAT depthFormat);
+    // Recreate the SRV after the application's depth buffer is resized.
+    void SetCollisionDepth(ID3D12Device* device, ID3D12Resource* depthBuffer);
     void Reset(ID3D12GraphicsCommandList* commands);
     void Simulate(ID3D12GraphicsCommandList* commands, float deltaTime, UINT emitCount,
         const DirectX::XMFLOAT3& emitter, float floorY);
+    void SimulateWithDepth(ID3D12GraphicsCommandList* commands, float deltaTime, UINT emitCount,
+        const DirectX::XMFLOAT3& emitter, float floorY, ID3D12Resource* depthBuffer,
+        DirectX::FXMMATRIX view, DirectX::CXMMATRIX projection,
+        const DirectX::XMFLOAT3& cameraPosition, UINT depthWidth, UINT depthHeight);
     // The caller binds the two G-buffer RTVs, depth buffer and viewport.
     void Draw(ID3D12GraphicsCommandList* commands,
         DirectX::FXMMATRIX view, DirectX::CXMMATRIX projection);
@@ -38,6 +44,11 @@ private:
     void CopyCount(ID3D12GraphicsCommandList* commands, UINT bufferIndex);
     void MakeWritable(ID3D12GraphicsCommandList* commands, UINT bufferIndex);
     D3D12_GPU_DESCRIPTOR_HANDLE Uav(UINT bufferIndex) const;
+    D3D12_GPU_DESCRIPTOR_HANDLE DepthSrv() const;
+    void SimulateInternal(ID3D12GraphicsCommandList* commands, float deltaTime, UINT emitCount,
+        const DirectX::XMFLOAT3& emitter, float floorY, bool depthCollision,
+        DirectX::FXMMATRIX view, DirectX::CXMMATRIX projection,
+        const DirectX::XMFLOAT3& cameraPosition, UINT depthWidth, UINT depthHeight);
 
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> mParticles;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> mCounters;
@@ -54,6 +65,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mDrawPso;
     Microsoft::WRL::ComPtr<ID3D12CommandSignature> mDrawSignature;
     UINT mDescriptorSize = 0;
+    DXGI_FORMAT mDepthSrvFormat = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
     UINT mActive = 0;
     UINT mSeed = 0;
 };

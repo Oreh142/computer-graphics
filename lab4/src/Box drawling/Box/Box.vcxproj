@@ -67,6 +67,11 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <LinkIncremental>true</LinkIncremental>
   </PropertyGroup>
@@ -141,13 +146,17 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="..\..\Common\DDSTextureLoader.cpp" />
     <ClCompile Include="..\..\Common\FreeCamera.cpp" />
+    <ClCompile Include="..\..\Common\GeometryGenerator.cpp" />
     <ClCompile Include="..\..\Common\d3dApp.cpp" />
     <ClCompile Include="..\..\Common\d3dUtil.cpp" />
     <ClCompile Include="..\..\Common\GameTimer.cpp" />
     <ClCompile Include="..\..\Common\MathHelper.cpp" />
     <ClCompile Include="BoxApp.cpp" />
     <ClCompile Include="GBuffer.cpp" />
+    <ClCompile Include="GpuParticleSystem.cpp" />
+    <ClCompile Include="PostProcessing.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\Common\FreeCamera.h" />
@@ -158,6 +167,12 @@
     <ClInclude Include="..\..\Common\UploadBuffer.h" />
     <ClInclude Include="GBuffer.h" />
     <ClInclude Include="RenderingSystem.h" />
+    <ClInclude Include="GpuParticleSystem.h" />
+    <ClInclude Include="PostProcessing.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Shaders\particles.hlsl" />
+    <None Include="Shaders\postprocess.hlsl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

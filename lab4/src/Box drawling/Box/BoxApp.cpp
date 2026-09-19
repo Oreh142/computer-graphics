@@ -207,6 +207,98 @@ namespace
         return MakeBoundingBox(minPoint, maxPoint);
     }
 
+    std::vector<std::uint8_t> BuildCatShadowMask(UINT size)
+    {
+        constexpr UINT kSamplesPerAxis = 4;
+        constexpr float kInvSampleCount = 1.0f / static_cast<float>(kSamplesPerAxis * kSamplesPerAxis);
+
+        auto insideEllipse = [](float x, float y, float cx, float cy, float rx, float ry)
+        {
+            const float dx = (x - cx) / rx;
+            const float dy = (y - cy) / ry;
+            return dx * dx + dy * dy <= 1.0f;
+        };
+
+        auto insideTriangle = [](float x, float y,
+            float ax, float ay, float bx, float by, float cx, float cy)
+        {
+            const auto cross = [](float px, float py, float qx, float qy, float rx, float ry)
+            {
+                return (qx - px) * (ry - py) - (qy - py) * (rx - px);
+            };
+
+            const float e0 = cross(ax, ay, bx, by, x, y);
+            const float e1 = cross(bx, by, cx, cy, x, y);
+            const float e2 = cross(cx, cy, ax, ay, x, y);
+            const bool hasNegative = e0 < 0.0f || e1 < 0.0f || e2 < 0.0f;
+            const bool hasPositive = e0 > 0.0f || e1 > 0.0f || e2 > 0.0f;
+            return !(hasNegative && hasPositive);
+        };
+
+        auto insideCapsule = [](float x, float y, float ax, float ay, float bx, float by, float radius)
+        {
+            const float abx = bx - ax;
+            const float aby = by - ay;
+            const float abLengthSq = abx * abx + aby * aby;
+            const float t = abLengthSq > 0.0f
+                ? std::clamp(((x - ax) * abx + (y - ay) * aby) / abLengthSq, 0.0f, 1.0f)
+                : 0.0f;
+            const float dx = x - (ax + abx * t);
+            const float dy = y - (ay + aby * t);
+            return dx * dx + dy * dy <= radius * radius;
+        };
+
+        auto insideCat = [&](float u, float v)
+        {
+            const bool ears =
+                insideTriangle(u, v, 0.35f, 0.24f, 0.36f, 0.07f, 0.45f, 0.18f) ||
+                insideTriangle(u, v, 0.52f, 0.18f, 0.61f, 0.07f, 0.60f, 0.24f);
+            const bool head = insideEllipse(u, v, 0.48f, 0.28f, 0.145f, 0.135f);
+            const bool neck = insideEllipse(u, v, 0.49f, 0.41f, 0.12f, 0.14f);
+            const bool body = insideEllipse(u, v, 0.50f, 0.64f, 0.19f, 0.30f);
+            const bool haunch = insideEllipse(u, v, 0.59f, 0.72f, 0.20f, 0.20f);
+            const bool frontLegs =
+                insideCapsule(u, v, 0.42f, 0.67f, 0.40f, 0.91f, 0.045f) ||
+                insideCapsule(u, v, 0.50f, 0.68f, 0.50f, 0.91f, 0.043f);
+            const bool paws =
+                insideEllipse(u, v, 0.39f, 0.92f, 0.075f, 0.038f) ||
+                insideEllipse(u, v, 0.50f, 0.92f, 0.070f, 0.038f);
+            const bool tail =
+                insideCapsule(u, v, 0.66f, 0.67f, 0.79f, 0.75f, 0.045f) ||
+                insideCapsule(u, v, 0.79f, 0.75f, 0.84f, 0.85f, 0.043f) ||
+                insideCapsule(u, v, 0.84f, 0.85f, 0.76f, 0.92f, 0.040f) ||
+                insideCapsule(u, v, 0.76f, 0.92f, 0.61f, 0.93f, 0.038f);
+
+            return ears || head || neck || body || haunch || frontLegs || paws || tail;
+        };
+
+        std::vector<std::uint8_t> pixels(static_cast<size_t>(size) * size * 4, 255);
+        for (UINT y = 0; y < size; ++y)
+        {
+            for (UINT x = 0; x < size; ++x)
+            {
+                UINT coveredSamples = 0;
+                for (UINT sampleY = 0; sampleY < kSamplesPerAxis; ++sampleY)
+                {
+                    for (UINT sampleX = 0; sampleX < kSamplesPerAxis; ++sampleX)
+                    {
+                        const float u = (static_cast<float>(x) + (static_cast<float>(sampleX) + 0.5f) / kSamplesPerAxis) /
+                            static_cast<float>(size);
+                        const float v = (static_cast<float>(y) + (static_cast<float>(sampleY) + 0.5f) / kSamplesPerAxis) /
+                            static_cast<float>(size);
+                        coveredSamples += insideCat(u, v) ? 1u : 0u;
+                    }
+                }
+
+                const size_t pixelIndex = (static_cast<size_t>(y) * size + x) * 4;
+                pixels[pixelIndex + 3] = static_cast<std::uint8_t>(
+                    std::round(255.0f * static_cast<float>(coveredSamples) * kInvSampleCount));
+            }
+        }
+
+        return pixels;
+    }
+
     XMFLOAT3 BuildFallbackTangent(const XMFLOAT3& normal)
     {
         XMVECTOR n = XMVector3Normalize(XMLoadFloat3(&normal));
@@ -360,6 +452,8 @@ private:
         bool AnimateUv = false;
         bool Cullable = false;
         bool Billboard = false;
+        bool ShadowOnly = false;
+        bool ShadowAlphaTested = false;
         XMFLOAT2 UvScale = XMFLOAT2(1.0f, 1.0f);
         float DisplacementScale = 0.0f;
         float BillboardWidth = 1.0f;
@@ -420,6 +514,7 @@ private:
     std::unique_ptr<OctreeNode> mForestOctreeRoot = nullptr;
     std::vector<std::unique_ptr<Texture>> mTextures;
     std::unordered_map<std::string, UINT> mTextureIndexByName;
+    UINT mCatShadowSrvIndex = kInvalidIndex;
 
     ComPtr<ID3DBlob> mGBufferVS = nullptr;
     ComPtr<ID3DBlob> mGBufferPS = nullptr;
@@ -644,6 +739,7 @@ bool BoxApp::Initialize()
     BuildRootSignatures();
     BuildPSOs();
     mParticles.Initialize(md3dDevice.Get(), mCommandList.Get(), mDepthStencilFormat);
+    mParticles.SetCollisionDepth(md3dDevice.Get(), mDepthStencilBuffer.Get());
     mDeferredRenderer.Buffers.Build(md3dDevice.Get(), mClientWidth, mClientHeight);
     mPostProcessing.Initialize(md3dDevice.Get());
     mPostProcessing.Resize(md3dDevice.Get(), mClientWidth, mClientHeight,
@@ -681,6 +777,7 @@ void BoxApp::OnResize()
     {
         mDeferredRenderer.Buffers.Resize(md3dDevice.Get(), mClientWidth, mClientHeight);
         UpdateDeferredSrvDescriptors();
+        mParticles.SetCollisionDepth(md3dDevice.Get(), mDepthStencilBuffer.Get());
         if (mPostProcessing.IsInitialized())
             mPostProcessing.Resize(md3dDevice.Get(), mClientWidth, mClientHeight,
                 mDeferredRenderer.Buffers.AlbedoResource(), mDeferredRenderer.Buffers.NormalResource(), mDepthStencilBuffer.Get());
@@ -719,7 +816,7 @@ void BoxApp::UpdateVisibleBatches()
         for (UINT i = 0; i < static_cast<UINT>(mDrawBatches.size()); ++i)
         {
             const DrawBatch& batch = mDrawBatches[i];
-            if (batch.SceneId == mActiveScene && !batch.Cullable)
+            if (batch.SceneId == mActiveScene && !batch.Cullable && !batch.ShadowOnly)
                 mVisibleBatchIndices.push_back(i);
         }
     };
@@ -1127,7 +1224,9 @@ void BoxApp::DrawShadowPass()
     const UINT shadowCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ShadowObjectConstants));
     const UINT shadowCasterCount = static_cast<UINT>(mShadowCasterBatchIndices.size());
     const D3D12_GPU_VIRTUAL_ADDRESS shadowCbAddress = mShadowCB->Resource()->GetGPUVirtualAddress();
-    mCommandList->SetPipelineState(mShadowOpaquePSO.Get());
+    const UINT descriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const auto baseSrvHandle = mCbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    ID3D12PipelineState* currentShadowPSO = nullptr;
 
     for (UINT cascadeIndex = 0; cascadeIndex < kShadowCascadeCount; ++cascadeIndex)
     {
@@ -1139,6 +1238,22 @@ void BoxApp::DrawShadowPass()
         {
             const UINT batchIndex = mShadowCasterBatchIndices[casterIndex];
             const DrawBatch& batch = mDrawBatches[batchIndex];
+
+            ID3D12PipelineState* desiredPSO = batch.ShadowAlphaTested
+                ? mShadowAlphaTestPSO.Get()
+                : mShadowOpaquePSO.Get();
+            if (currentShadowPSO != desiredPSO)
+            {
+                mCommandList->SetPipelineState(desiredPSO);
+                currentShadowPSO = desiredPSO;
+            }
+
+            if (batch.ShadowAlphaTested)
+            {
+                auto diffuseHandle = baseSrvHandle;
+                diffuseHandle.ptr += static_cast<SIZE_T>(batch.DiffuseSrvIndex) * descriptorSize;
+                mCommandList->SetGraphicsRootDescriptorTable(1, diffuseHandle);
+            }
 
             const UINT shadowCBIndex = cascadeIndex * shadowCasterCount + casterIndex;
             mCommandList->SetGraphicsRootConstantBufferView(0, shadowCbAddress + static_cast<UINT64>(shadowCBIndex) * shadowCBByteSize);
@@ -1164,16 +1279,6 @@ void BoxApp::Draw(const GameTimer& gt)
         mParticles.Reset(mCommandList.Get());
         mParticleEmissionRemainder = 0.0f;
         mParticlesResetRequested = false;
-    }
-    if (!mParticlesPaused)
-    {
-        const float particleDt = (std::max)(0.0f, (std::min)(gt.DeltaTime(), 1.0f / 30.0f));
-        mParticleEmissionRemainder += 1200.0f * particleDt;
-        const UINT emitCount = static_cast<UINT>(mParticleEmissionRemainder);
-        mParticleEmissionRemainder -= static_cast<float>(emitCount);
-        const XMFLOAT3 emitter = (mActiveScene == kSceneForest)
-            ? XMFLOAT3(0.0f, 1.0f, -64.0f) : XMFLOAT3(0.0f, 0.7f, -2.5f);
-        mParticles.Simulate(mCommandList.Get(), particleDt, emitCount, emitter, 0.1f);
     }
     DrawShadowPass();
 
@@ -1236,6 +1341,20 @@ void BoxApp::Draw(const GameTimer& gt)
     drawBatches(false, true, mGBufferBillboardPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     drawBatches(true, false, mGBufferTessPSO.Get(), D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
 
+    // Geometry supplies the current frame's depth. The particle compute pass reads it,
+    // resolves screen-space collisions, and returns it to DEPTH_WRITE for particle drawing.
+    if (!mParticlesPaused)
+    {
+        const float particleDt = (std::max)(0.0f, (std::min)(gt.DeltaTime(), 1.0f / 30.0f));
+        mParticleEmissionRemainder += 1200.0f * particleDt;
+        const UINT emitCount = static_cast<UINT>(mParticleEmissionRemainder);
+        mParticleEmissionRemainder -= static_cast<float>(emitCount);
+        const XMFLOAT3 emitter = (mActiveScene == kSceneForest)
+            ? XMFLOAT3(0.0f, 1.0f, -64.0f) : XMFLOAT3(0.0f, 0.7f, -2.5f);
+        mParticles.SimulateWithDepth(mCommandList.Get(), particleDt, emitCount, emitter, 0.1f,
+            depth, mCamera.GetView(), mCamera.GetProj(), mCamera.GetPosition3f(),
+            static_cast<UINT>(mClientWidth), static_cast<UINT>(mClientHeight));
+    }
     mParticles.Draw(mCommandList.Get(), mCamera.GetView(), mCamera.GetProj());
 
     CD3DX12_RESOURCE_BARRIER toLighting[4] =
@@ -1666,7 +1785,7 @@ void BoxApp::BuildDescriptorHeaps()
 void BoxApp::BuildDeferredSrvHeap()
 {
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 4;
+    heapDesc.NumDescriptors = 5;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     heapDesc.NodeMask = 0;
@@ -1714,6 +1833,18 @@ void BoxApp::UpdateDeferredSrvDescriptors()
     shadowSrv.Texture2DArray.ArraySize = kShadowCascadeCount;
     shadowSrv.Texture2DArray.ResourceMinLODClamp = 0.0f;
     md3dDevice->CreateShaderResourceView(mShadowMap.Get(), &shadowSrv, dstCpu);
+    dstCpu.ptr += descriptorSize;
+
+    assert(mCatShadowSrvIndex < mTextures.size());
+    ID3D12Resource* catMask = mTextures[mCatShadowSrvIndex]->Resource.Get();
+    D3D12_SHADER_RESOURCE_VIEW_DESC catMaskSrv = {};
+    catMaskSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    catMaskSrv.Format = catMask->GetDesc().Format;
+    catMaskSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    catMaskSrv.Texture2D.MostDetailedMip = 0;
+    catMaskSrv.Texture2D.MipLevels = catMask->GetDesc().MipLevels;
+    catMaskSrv.Texture2D.ResourceMinLODClamp = 0.0f;
+    md3dDevice->CreateShaderResourceView(catMask, &catMaskSrv, dstCpu);
 }
 
 void BoxApp::BuildShadowResources()
@@ -1844,7 +1975,7 @@ void BoxApp::BuildRootSignatures()
         serializedRootSig->GetBufferSize(), IID_PPV_ARGS(&mShadowRootSignature)));
 
     CD3DX12_DESCRIPTOR_RANGE lightSrvTable;
-    lightSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0);
+    lightSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0);
 
     CD3DX12_ROOT_PARAMETER lightRootParameter[2];
     lightRootParameter[0].InitAsDescriptorTable(1, &lightSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
@@ -1942,12 +2073,14 @@ void BoxApp::BuildBoxGeometry()
     mDrawBatches.clear();
     mVisibleBatchIndices.clear();
     mShadowCasterBatchIndices.clear();
+    mCatShadowSrvIndex = kInvalidIndex;
     mForestObjects.clear();
     mForestOctreeRoot.reset();
 
     const UINT whiteSrv = CreateSolidColorTexture("__white", { 255, 255, 255, 255 });
     const UINT flatNormalSrv = CreateSolidColorTexture("__flatNormal", { 128, 128, 255, 255 });
     const UINT neutralDisplacementSrv = CreateSolidColorTexture("__neutralDisplacement", { 128, 128, 128, 255 });
+    mCatShadowSrvIndex = CreateRgbaTexture("__catShadowMask", 128, 128, BuildCatShadowMask(128));
 
     std::vector<Vertex> vertices;
     std::vector<std::uint32_t> indices;
@@ -2185,6 +2318,17 @@ void BoxApp::BuildBoxGeometry()
         XMStoreFloat4x4(&waterBatch.World, XMMatrixTranslation(-6.65f, 0.06f, -0.45f));
         addGeneratedMesh(geoGen.CreateGrid(6.0f, 4.0f, 8, 8), waterBatch);
 
+        DrawBatch catShadowBatch;
+        catShadowBatch.DiffuseSrvIndex = mCatShadowSrvIndex;
+        catShadowBatch.NormalSrvIndex = flatNormalSrv;
+        catShadowBatch.DisplacementSrvIndex = neutralDisplacementSrv;
+        catShadowBatch.ShadowOnly = true;
+        catShadowBatch.ShadowAlphaTested = true;
+        XMStoreFloat4x4(&catShadowBatch.World,
+            XMMatrixScaling(1.50f, 1.65f, 1.0f) *
+            XMMatrixTranslation(-2.87f, 5.22f, 1.62f));
+        addGeneratedMesh(geoGen.CreateQuad(-0.5f, 0.5f, 1.0f, 1.0f, 0.0f), catShadowBatch);
+
         constexpr int kTreeColumns = 200;
         constexpr int kTreeRows = 100;
         constexpr UINT kTreeCount = kTreeColumns * kTreeRows;
@@ -2407,6 +2551,7 @@ void BoxApp::BuildPSOs()
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&shadowPsoDesc, IID_PPV_ARGS(&mShadowOpaquePSO)));
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowAlphaPsoDesc = shadowPsoDesc;
+    shadowAlphaPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     shadowAlphaPsoDesc.PS =
     {
         reinterpret_cast<BYTE*>(mShadowPS->GetBufferPointer()),

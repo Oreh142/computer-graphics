@@ -155,7 +155,7 @@ ShadowOut ShadowVS(VertexIn vin)
 
 void ShadowPS(ShadowOut pin)
 {
-    float4 albedo = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC) * gTint;
+    float4 albedo = gDiffuseMap.SampleLevel(gsamLinearWrap, pin.TexC, 0.0f) * gTint;
     clip(albedo.a - 0.35f);
 }
 
@@ -263,6 +263,7 @@ Texture2D gAlbedoMap : register(t0);
 Texture2D gNormalBufferMap : register(t1);
 Texture2D gDepthMap : register(t2);
 Texture2DArray gShadowMap : register(t3);
+Texture2D gCatShadowMask : register(t4);
 
 #define MAX_POINT_LIGHTS 16
 #define MAX_DIRECTIONAL_LIGHTS 8
@@ -395,6 +396,29 @@ float SampleShadowFactor(float3 posW, float viewDepth)
     return shadow2x2 * 0.25f;
 }
 
+float SampleCatShadowFactor(float3 posW)
+{
+    if (gShadowsEnabled == 0)
+        return 1.0f;
+
+    const float2 projectionMin = float2(-3.30f, 3.45f);
+    const float2 projectionSize = float2(1.50f, 1.65f);
+    float2 uv = float2(
+        (posW.x - projectionMin.x) / projectionSize.x,
+        1.0f - (posW.y - projectionMin.y) / projectionSize.y);
+
+    if (any(uv <= 0.0f) || any(uv >= 1.0f))
+        return 1.0f;
+
+    const float receiverDistance = abs(posW.z - 1.85f);
+    if (receiverDistance >= 0.60f)
+        return 1.0f;
+
+    const float receiverFade = 1.0f - smoothstep(0.30f, 0.60f, receiverDistance);
+    const float catAlpha = gCatShadowMask.SampleLevel(gsamLinearWrap, uv, 0.0f).a;
+    return 1.0f - saturate(catAlpha * receiverFade) * 0.85f;
+}
+
 float3 EvaluateDirectionalLight(float3 albedo, float3 normalW, DirectionalLight light)
 {
     float3 L = normalize(-light.Direction);
@@ -459,7 +483,9 @@ float4 LightingPS(FSOut pin) : SV_Target
     [loop]
     for (uint dirIndex = 0; dirIndex < gDirectionalLightCount; ++dirIndex)
     {
-        float shadowFactor = (dirIndex == 0) ? SampleShadowFactor(posW, posV.z) : 1.0f;
+        float shadowFactor = 1.0f;
+        if (dirIndex == 0)
+            shadowFactor = SampleShadowFactor(posW, posV.z);
         result += EvaluateDirectionalLight(albedo.rgb, normalW, gDirectionalLights[dirIndex]) * shadowFactor;
     }
 
@@ -474,6 +500,9 @@ float4 LightingPS(FSOut pin) : SV_Target
     {
         result += EvaluateSpotLight(albedo.rgb, normalW, posW, gSpotLights[spotIndex]);
     }
+
+    const float catShadowFactor = SampleCatShadowFactor(posW);
+    result *= catShadowFactor;
 
     return float4(result, albedo.a);
 }
